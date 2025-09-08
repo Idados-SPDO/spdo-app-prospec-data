@@ -5,6 +5,8 @@ import duckdb
 import re
 from uuid import uuid4
 from datetime import date, datetime
+from pathlib import Path
+import os
 
 # =========================
 # CONFIG
@@ -16,9 +18,9 @@ st.logo("logo_ibre.png")
 # MOCK DE USUÁRIOS
 # =========================
 USERS = {
-    "yago": {"password": "123", "name": "Yago Moraes", "role": "admin"},
-    "ana": {"password": "123", "name": "Ana Silva", "role": "analista"},
-    "joao": {"password": "123", "name": "João Souza", "role": "gestor"},
+    "spdo_yago": {"password": "123", "name": "Yago Moraes", "role": "admin"},
+    "spdo_maicon": {"password": "123", "name": "Maicon Cruz", "role": "admin"},
+    "spdo_tatiana": {"password": "123", "name": "Tatiana Scheiner", "role": "admin"},
 }
 
 # =========================
@@ -92,6 +94,21 @@ SETORES = [
 # =========================
 # Helpers de DB
 # =========================
+UPLOAD_DIR = Path("uploads")
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+def _store_uploaded_file(file) -> str:
+    """Salva UM arquivo enviado e retorna o caminho relativo (str)."""
+    if not file:
+        return ""
+    ext = Path(file.name).suffix
+    dest = UPLOAD_DIR / f"{uuid4().hex}{ext}"
+    with open(dest, "wb") as out:
+        out.write(file.read())
+    return dest.as_posix()
+
+def _is_url(s: str) -> bool:
+    return bool(re.match(r"^https?://", str(s).strip(), flags=re.I))
+
 def _ensure_table():
     con = duckdb.connect(DB_PATH)
     # cria se não existir (com as colunas) 
@@ -348,8 +365,34 @@ def open_details_dialog(rec: dict):
                     if not nda_assinado_bool:
                         nda_date = None
 
-                    mat = st.text_area(DB_TO_LABEL["MATERIAL_APRESENTACAO"], value=rec.get("MATERIAL_APRESENTACAO") or "", placeholder="URL1; URL2", height=100)
+                    rec_id = rec.get("ID", "novo")
+                    existing_mat = (rec.get("MATERIAL_APRESENTACAO") or "").strip()
 
+                    st.text_input(
+                        "Material atual (caminho/URL)",
+                        value=existing_mat,
+                        key=f"mat_preview_{rec_id}",
+                        disabled=True
+                    )
+
+                    up_new = st.file_uploader(
+                        "Enviar novo material (substitui o atual)",
+                        type=["pdf","ppt","pptx","zip","doc","docx"],
+                        accept_multiple_files=False,
+                        key=f"up_mat_{rec_id}"
+                    )
+
+                    mat_url = st.text_input(
+                        "ou cole uma URL (opcional)",
+                        value="",
+                        key=f"mat_url_{rec_id}"
+                    )
+
+                    remove_mat = st.checkbox(
+                        "Remover material atual",
+                        value=False,
+                        key=f"mat_rm_{rec_id}"
+                    )
             # =========================
             # 📝 DESCRIÇÃO & OFERTA
             # =========================
@@ -364,12 +407,13 @@ def open_details_dialog(rec: dict):
             c1, c2, c3 = st.columns([1,1,1])
             salvar = c1.form_submit_button("Salvar alterações", type="primary", use_container_width=True)
             fechar = c2.form_submit_button("Fechar", use_container_width=True)
-            abrir_links = c3.form_submit_button("Abrir apresentações", use_container_width=True)
-
-            if abrir_links:
-                # abre os links de apresentação (se houver)
-                for j, item in enumerate(_split_multi(mat or "")):
-                    st.link_button("Baixar apresentação", _normalize_url(item), key=f"lnk-{rec.get('ID','novo')}-{j}")
+            new_material = existing_mat  # padrão: mantém
+            if remove_mat:
+                new_material = None
+            elif up_new is not None:
+                new_material = _store_uploaded_file(up_new)  # salva e substitui
+            elif (mat_url or "").strip():
+                new_material = _normalize_url(mat_url.strip())  # substitui por URL
 
             if fechar:
                 st.rerun()
@@ -390,7 +434,7 @@ def open_details_dialog(rec: dict):
                     "DADOS_FORNECEDOR": dados.strip() or None,
                     "CONTATO": cont.strip() or None,
                     "STATUS": status.strip() or None,  # <- vem do selectbox
-                    "MATERIAL_APRESENTACAO": (mat or "").strip() or None,
+                    "MATERIAL_APRESENTACAO": new_material,
                     "NDA_ASSINADO_EM": nda_date.isoformat() if nda_date else None,
                 }
                 try:
@@ -400,7 +444,28 @@ def open_details_dialog(rec: dict):
                 except Exception as e:
                     st.error(f"Erro ao atualizar: {e}")
 
-    _dialog()
+
+        st.markdown("#### Material de apresentação")
+
+        cur = (rec.get("MATERIAL_APRESENTACAO") or "").strip()
+        if not cur:
+            st.caption("Nenhum material cadastrado.")
+        elif _is_url(cur):
+            st.link_button("Abrir material (URL)", _normalize_url(cur), use_container_width=True, key=f"open_{rec_id}")
+        else:
+            p = Path(cur)
+            if p.exists():
+                with open(p, "rb") as fh:
+                    st.download_button(
+                        "Baixar material",
+                        fh.read(),
+                        file_name=p.name,
+                        use_container_width=True,
+                        key=f"dl_{rec_id}"
+                    )
+            else:
+                st.caption(f"Arquivo não encontrado: `{cur}`")
+    _dialog()   
 
 
 def open_create_dialog(default_categoria: str | None = None):
@@ -452,7 +517,7 @@ def open_create_dialog(default_categoria: str | None = None):
         c1, c2 = st.columns([1,1])
         salvar = c1.button("Salvar", type="primary", use_container_width=True)
         cancelar = c2.button("Cancelar", use_container_width=True)
-
+        
         if cancelar:
             st.rerun()
 
@@ -504,6 +569,23 @@ def ensure_state():
         st.session_state.filtro_status_sel = "Todos"
 
 ensure_state()
+
+def render_public_home():
+    st.title("🏗️ Atuação de Prospecção de Dados — FGV IBRE")
+    st.caption("Hub interno para prospecção de fornecedores de dados, parcerias e acompanhamentos de NDA.")
+
+    # Hero / resumo rápido
+    st.markdown(
+        """
+        **Prospecção Dados** centraliza o ciclo de prospecção de fornecedores:
+        - 📥 Importação de planilhas (.xlsx) padronizadas  
+        - 🗂️ Organização por **Setor** e **Status**  
+        - 🔎 Consulta rápida e abertura de **detalhes** por fornecedor  
+        - 📝 Registro de **NDA assinado** com data  
+        - 📎 Armazenamento de **materiais de apresentação**
+        """)
+    st.divider()
+
 
 with st.sidebar:
     st.subheader("🔐 Acesso")
@@ -569,11 +651,9 @@ with st.sidebar:
 
 # Somente login
 if not st.session_state.auth["is_auth"]:
+    render_public_home()   # ← mostra a home explicativa
     st.stop()
 
-# =========================
-# CONTEÚDO PRINCIPAL
-# =========================
 # =========================
 # CONTEÚDO PRINCIPAL
 # =========================
