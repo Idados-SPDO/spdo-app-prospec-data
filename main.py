@@ -21,6 +21,7 @@ USERS = {
     "spdo_yago": {"password": "123", "name": "Yago Moraes", "role": "admin"},
     "spdo_maicon": {"password": "123", "name": "Maicon Cruz", "role": "admin"},
     "spdo_tatiana": {"password": "123", "name": "Tatiana Scheiner", "role": "admin"},
+    "spdo_arnaldo": {"password": "123", "name": "Arnaldo Brito", "role": "admin"},
 }
 
 # =========================
@@ -780,3 +781,4 @@ with tab_status:
             ].copy()
 
         render_cards(df_view_status, f"Status: {status_sel}", key_prefix=f"status-{_slug(status_sel)}")
+
