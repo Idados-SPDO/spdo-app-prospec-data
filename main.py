@@ -18,581 +18,503 @@ st.logo("logo_ibre.png")
 # MOCK DE USUÁRIOS
 # =========================
 USERS = {
-    "spdo_yago": {"password": "123", "name": "Yago Moraes", "role": "admin"},
-    "spdo_maicon": {"password": "123", "name": "Maicon Cruz", "role": "admin"},
-    "spdo_tatiana": {"password": "123", "name": "Tatiana Scheiner", "role": "admin"},
-    "spdo_arnaldo": {"password": "123", "name": "Arnaldo Brito", "role": "admin"},
+    "spdo_visual": {"password": "123", "name": "SPDO Visual", "role": "visual"},
+    "spdo_admin" :{"password": "123", "name": "SPDO Admin", "role": "admin"}, 
 }
 
 # =========================
 # DUCKDB
 # =========================
 DB_PATH = "parcerias.db"
-TABLE_NAME = "FORNECEDOR"
+TABLE_MAIN = "PROSPECCAO"
+TABLE_COMMENTS = "PROSPECCAO_COMENTARIOS"
 
-# Mapeamento: coluna do Excel -> coluna da tabela FORNECEDOR
-EXCEL_TO_DB = {
-    "Fornecedor": "FORNECEDOR",
-    "Classificação do Fornecedor": "CLASSIFICACAO",
-    "Categoria": "CATEGORIA",
-    "Âmbito": "AMBITO",
-    "Site": "SITE",
-    "Descrição do Fornecedor": "DESC_FORNECEDOR",
-    "O que o fornecedor oferece?": "OFERTA_FORNECEDOR",
-    "Periodicidade": "PERIODICIDADE",
-    "Como o fornecedor obtém os dados?": "DADOS_FORNECEDOR",
-    "E-mails contato": "CONTATO",
-    "Status": "STATUS",
-    "Material de apresentação da empresa": "MATERIAL_APRESENTACAO",
-}
-
-STATUSES = [
-    "Todos",
-    "Contato não iniciado",
-    "Contato iniciado e em andamento",
-    "Contato iniciado mas sem ir a frente",
-    "Assinatura NDA - Fornecedor",
-    "Assinatura NDA - FGV IBRE",
-    "Parceria concluída com sucesso.",
+# Colunas que esperamos na planilha
+EXPECTED_COLS = [
+    "Prioridade","Situação","CNPJ","Nome da Empresa","Segmento","Descrição","Resumo","Metodologia",
+    "Cobertura","Site","Contatos","Data de Assinatura","Validade em Anos","Validade em Meses",
+    "Validade em Dias","Início da Renovação da Assinatura","Vigência","Status","NDA Assinado",
+    "Documento","Aprovação","Analise técnica","Relacionamento","Automação","OBS",
+    "Pontos Fortes","Pontos Fracos","Concorrentes","Status Atual"
 ]
 
-# Colunas extras (não vêm do Excel)
-EXTRA_COLS = ["ID", "NDA_ASSINADO_EM"]
-DB_COL_ORDER = ["ID", *EXCEL_TO_DB.values(), "NDA_ASSINADO_EM"]
-DB_TO_LABEL = {
-    **{v: k for k, v in EXCEL_TO_DB.items()},
-    "ID": "ID",
-    "NDA_ASSINADO_EM": "NDA assinado em",
-}
-
-# Classificação (mostramos "A — ..." no UI e salvamos só o código "A"/"B"/"C")
-CLASSIFICACAO_OPTIONS = {
-    "A": "Fornecedor de dados (compra ou parceria)",
-    "B": "Não fornece os dados, mas pode oferecer alguma solução",
-    "C": "Tem potencial para parceria de novos negócios",
-}
-CLASSIFICACAO_CHOICES = [f"{k} — {v}" for k, v in CLASSIFICACAO_OPTIONS.items()]
-
-# Âmbito
-AMBITO_OPTIONS = ["Nacional", "Global"]
-
-
-# Setores para filtro
-SETORES = [
-    "Todos",
-    "Alimentos/Bebidas",
-    "Atacado/Varejo",
-    "Construção/Infraestrutura",
-    "Cosméticos",
-    "Energia",
-    "Saúde",
-    "Mercado Financeiro",
-    "Mão de Obra",
-    "Mercado Imobiliário",
-    "Outras Industrias",
-]
+# Segmentos para filtro
+SEGMENT_FILTERS = ["Todos", "SOLUÇÃO", "FORNECEDOR DE DADOS", "DADOS", "POTENCIAIS NOVOS NEGÓCIOS"]
 
 # =========================
-# Helpers de DB
-# =========================
-UPLOAD_DIR = Path("uploads")
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-def _store_uploaded_file(file) -> str:
-    """Salva UM arquivo enviado e retorna o caminho relativo (str)."""
-    if not file:
-        return ""
-    ext = Path(file.name).suffix
-    dest = UPLOAD_DIR / f"{uuid4().hex}{ext}"
-    with open(dest, "wb") as out:
-        out.write(file.read())
-    return dest.as_posix()
-
-def _is_url(s: str) -> bool:
-    return bool(re.match(r"^https?://", str(s).strip(), flags=re.I))
-
-def _ensure_table():
-    con = duckdb.connect(DB_PATH)
-    # cria se não existir (com as colunas) 
-    col_defs = ", ".join(f"{c} TEXT" for c in DB_COL_ORDER)
-    con.execute(f"CREATE TABLE IF NOT EXISTS {TABLE_NAME} ({col_defs});")
-    # garante colunas novas
-    cols_df = con.execute(f"PRAGMA table_info('{TABLE_NAME}')").df()
-    existing = set(cols_df["name"].tolist())
-    for col in DB_COL_ORDER:
-        if col not in existing:
-            con.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN {col} TEXT;")
-    con.close()
-
-def _persist_full_df(df: pd.DataFrame):
-    """Regrava a tabela inteira com df nas colunas DB_COL_ORDER."""
-    con = duckdb.connect(DB_PATH)
-    con.execute(f"DELETE FROM {TABLE_NAME};")
-    con.register("df_fix", df[DB_COL_ORDER].astype(str))
-    cols = ", ".join(DB_COL_ORDER)
-    con.execute(f"INSERT INTO {TABLE_NAME} ({cols}) SELECT {cols} FROM df_fix;")
-    con.close()
-
-def import_to_duckdb(df_db: pd.DataFrame) -> int:
-    """Cria a tabela, injeta ID e NDA vazio e insere df_db."""
-    _ensure_table()
-    # Garante colunas extras
-    df_db = df_db.copy()
-    if "ID" not in df_db.columns:
-        df_db["ID"] = [str(uuid4()) for _ in range(len(df_db))]
-    if "NDA_ASSINADO_EM" not in df_db.columns:
-        df_db["NDA_ASSINADO_EM"] = None
-    df_db = df_db.reindex(columns=DB_COL_ORDER)
-
-    con = duckdb.connect(DB_PATH)
-    con.execute(f"DELETE FROM {TABLE_NAME};")
-    con.register("df_up", df_db.astype(str))
-    cols = ", ".join(DB_COL_ORDER)
-    con.execute(f"INSERT INTO {TABLE_NAME} ({cols}) SELECT {cols} FROM df_up;")
-    inserted = con.execute(f"SELECT COUNT(*) FROM {TABLE_NAME}").fetchone()[0]
-    con.close()
-    return inserted
-
-def insert_fornecedor(rec: dict) -> None:
-    """Insere um único fornecedor (gera ID se não vier)."""
-    _ensure_table()
-    payload = {c: rec.get(c, None) for c in DB_COL_ORDER}
-    if not payload.get("ID"):
-        payload["ID"] = str(uuid4())
-    df = pd.DataFrame([payload]).reindex(columns=DB_COL_ORDER)
-    con = duckdb.connect(DB_PATH)
-    con.register("df_new", df.astype(str))
-    cols = ", ".join(DB_COL_ORDER)
-    con.execute(f"INSERT INTO {TABLE_NAME} ({cols}) SELECT {cols} FROM df_new;")
-    con.close()
-
-def update_fornecedor(row_id: str, updates: dict) -> None:
-    """Atualiza colunas pelo ID."""
-    if not row_id:
-        raise ValueError("ID obrigatório para atualizar registro.")
-    # filtra apenas colunas válidas e diferentes de ID
-    valid_updates = {k: v for k, v in updates.items() if k in DB_COL_ORDER and k != "ID"}
-    if not valid_updates:
-        return
-    set_clause = ", ".join([f"{k} = ?" for k in valid_updates.keys()])
-    params = list(valid_updates.values()) + [row_id]
-    con = duckdb.connect(DB_PATH)
-    con.execute(f"UPDATE {TABLE_NAME} SET {set_clause} WHERE ID = ?;", params)
-    con.close()
-
-def load_fornecedores_df() -> pd.DataFrame:
-    """Carrega todos os fornecedores; cria/ajusta colunas e ID se necessário."""
-    _ensure_table()
-    con = duckdb.connect(DB_PATH)
-    try:
-        df = con.execute(f"SELECT * FROM {TABLE_NAME}").df()
-    except Exception:
-        df = pd.DataFrame(columns=DB_COL_ORDER)
-    con.close()
-
-    # Garante todas as colunas no DF
-    for c in DB_COL_ORDER:
-        if c not in df.columns:
-            df[c] = None
-    df = df.reindex(columns=DB_COL_ORDER)
-
-    # Se não há ID preenchido, gera e persiste
-    if len(df) and (df["ID"].isna() | (df["ID"].astype(str).str.strip() == "")).any():
-        df.loc[df["ID"].isna() | (df["ID"].astype(str).str.strip() == ""), "ID"] = [
-            str(uuid4()) for _ in range((df["ID"].isna() | (df["ID"].astype(str).str.strip() == "")).sum())
-        ]
-        _persist_full_df(df)
-
-    return df
-
-# =========================
-# Helpers de UI
-# =========================
-def _slug(s: str) -> str:
-    s = (s or "").strip().lower()
-    s = re.sub(r"\s+", "-", s)
-    s = re.sub(r"[^a-z0-9\-_.]+", "", s)
-    return s or "all"
-
-def _classif_to_code(val: str | None) -> str | None:
-    """Normaliza o valor para 'A'/'B'/'C' (se reconhecido)."""
-    if not val:
-        return None
-    s = str(val).strip()
-    if not s:
-        return None
-    # se já vier "A", "B", "C" (ou começando por isso)
-    first = s[0].upper()
-    if first in {"A", "B", "C"}:
-        return first
-    # tenta mapear por palavras-chave
-    s_low = s.lower()
-    if "fornecedor de dados" in s_low:
-        return "A"
-    if "não fornece" in s_low or "nao fornece" in s_low or "solução" in s_low or "solucao" in s_low:
-        return "B"
-    if "potencial" in s_low:
-        return "C"
-    return None  # deixa sem normalizar se não reconheceu
-
-def _classif_choice_index_from_rec(val: str | None) -> int:
-    """Descobre o índice do select a partir do valor salvo/antigo."""
-    code = _classif_to_code(val) or "A"
-    codes = list(CLASSIFICACAO_OPTIONS.keys())
-    return codes.index(code)
-
-def _classif_code_from_choice(choice: str) -> str:
-    """Converte 'A — ...' para 'A'."""
-    return choice.split("—", 1)[0].strip()
-
-def _ambito_norm(val: str | None) -> str | None:
-    """Normaliza para 'Nacional' ou 'Global' quando possível."""
-    if not val:
-        return None
-    s = str(val).strip().lower()
-    if s.startswith("nac"):
-        return "Nacional"
-    if s.startswith("glob") or s.startswith("intl") or s.startswith("internac"):
-        return "Global"
-    if s in {"nacional", "global"}:
-        return s.capitalize()
-    return None  # desconhecido: mantém None
-
-def _normalize_url(u: str) -> str:
-    if not u:
-        return u
-    u = u.strip()
-    if not u:
-        return u
-    if not re.match(r"^https?://", u, flags=re.I):
-        return "http://" + u
-    return u
-
-def _split_multi(s: str) -> list[str]:
-    """Divide por ; , e quebras de linha (sem cortar frases comuns)."""
-    if not s:
-        return []
-    parts = re.split(r"[;\n]+|,\s*(?=[^\s])", s)
-    return [p.strip() for p in parts if p and p.strip() and p.strip().lower() != "none"]
-
-def _norm(s):
-    return "" if s is None else str(s).strip().casefold()
-
-def _parse_date_str(s: str | None) -> date | None:
-    if not s or str(s).strip() == "" or str(s).strip().lower() == "none":
-        return None
-    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
-        try:
-            return datetime.strptime(str(s).strip(), fmt).date()
-        except Exception:
-            pass
-    return None  # formato desconhecido
-
-# =========================
-# DIALOGS
-# =========================
-def open_details_dialog(rec: dict):
-    titulo = f"Detalhes — {rec.get('FORNECEDOR') or 'Fornecedor'}"
-
-    @st.dialog(titulo, width="large")
-    def _dialog():
-        # CSS: aperta margens internas do dialog
-        st.markdown("""
-        <style>
-        [data-testid="stDialog"] p{margin:0 !important;}
-        [data-testid="stDialog"] ul{margin:0 !important;}
-        [data-testid="stDialog"] li{margin:0 !important;}
-        [data-testid="stDialog"] [data-testid="stMarkdown"]{margin:0 !important;}
-        [data-testid="stDialog"] [data-testid="column"]{padding-top:0 !important;padding-bottom:0 !important;}
-        [data-testid="stDialog"] .stButton{margin:0 !important;}
-        </style>
-        """, unsafe_allow_html=True)
-
-        with st.form(f"form_editar_fornecedor_{rec.get('ID','novo')}", clear_on_submit=False):
-            tab_geral, tab_contato, tab_textos = st.tabs(["📌 Geral", "📞 Contatos & NDA", "📝 Descrição & Oferta"])
-
-            # =========================
-            # 📌 GERAL
-            # =========================
-            with tab_geral:
-                col1, col2 = st.columns(2)
-
-                with col1:
-                    nome = st.text_input(DB_TO_LABEL["FORNECEDOR"], value=rec.get("FORNECEDOR") or "")
-                    classif = st.selectbox(
-                        DB_TO_LABEL["CLASSIFICACAO"],
-                        options=CLASSIFICACAO_CHOICES,
-                        index=_classif_choice_index_from_rec(rec.get("CLASSIFICACAO"))
-                    )
-                    cat_options = [s for s in SETORES if s != "Todos"]
-                    cat_value = rec.get("CATEGORIA") or cat_options[0]
-                    cat_index = cat_options.index(cat_value) if cat_value in cat_options else 0
-                    cat = st.selectbox(DB_TO_LABEL["CATEGORIA"], options=cat_options, index=cat_index)
-
-                with col2:
-                    amb_options = AMBITO_OPTIONS
-                    amb_default = _ambito_norm(rec.get("AMBITO")) or AMBITO_OPTIONS[0]
-                    amb_index = amb_options.index(amb_default) if amb_default in amb_options else 0
-                    amb = st.selectbox(DB_TO_LABEL["AMBITO"], options=amb_options, index=amb_index)
-                    site = st.text_area(DB_TO_LABEL["SITE"], value=rec.get("SITE") or "", placeholder="ex: site1.com; site2.com", height=90)
-
-                    # Status como SELECTBOX com STATUSES (sem "Todos")
-                    status_options = [s for s in STATUSES if s != "Todos"]
-                    cur_status = (rec.get("STATUS") or "").strip()
-                    status_idx = status_options.index(cur_status) if cur_status in status_options else 0
-                    status = st.selectbox(
-                        DB_TO_LABEL["STATUS"],
-                        options=status_options,
-                        index=status_idx,
-                        key=f"det_status_{rec.get('ID','novo')}"
-                    )
-
-            # =========================
-            # 📞 CONTATOS & NDA
-            # =========================
-            with tab_contato:
-                colA, colB = st.columns(2)
-
-                with colA:
-                    cont  = st.text_area(DB_TO_LABEL["CONTATO"], value=rec.get("CONTATO") or "", placeholder="email1@dominio; email2@dominio", height=100)
-                    peri  = st.text_input(DB_TO_LABEL["PERIODICIDADE"], value=rec.get("PERIODICIDADE") or "")
-                    dados = st.text_area(DB_TO_LABEL["DADOS_FORNECEDOR"], value=rec.get("DADOS_FORNECEDOR") or "", height=100)
-
-                with colB:
-                    st.markdown("**NDA**")
-                    colN1, colN2 = st.columns([1,2])
-                    nda_assinado_bool = colN1.checkbox("Assinado?", value=bool(rec.get("NDA_ASSINADO_EM")))
-                    nda_date_val = _parse_date_str(rec.get("NDA_ASSINADO_EM"))
-                    nda_date = colN2.date_input(DB_TO_LABEL["NDA_ASSINADO_EM"], value=nda_date_val or date.today(), disabled=not nda_assinado_bool)
-                    if not nda_assinado_bool:
-                        nda_date = None
-
-                    rec_id = rec.get("ID", "novo")
-                    existing_mat = (rec.get("MATERIAL_APRESENTACAO") or "").strip()
-
-                    st.text_input(
-                        "Material atual (caminho/URL)",
-                        value=existing_mat,
-                        key=f"mat_preview_{rec_id}",
-                        disabled=True
-                    )
-
-                    up_new = st.file_uploader(
-                        "Enviar novo material (substitui o atual)",
-                        type=["pdf","ppt","pptx","zip","doc","docx"],
-                        accept_multiple_files=False,
-                        key=f"up_mat_{rec_id}"
-                    )
-
-                    mat_url = st.text_input(
-                        "ou cole uma URL (opcional)",
-                        value="",
-                        key=f"mat_url_{rec_id}"
-                    )
-
-                    remove_mat = st.checkbox(
-                        "Remover material atual",
-                        value=False,
-                        key=f"mat_rm_{rec_id}"
-                    )
-            # =========================
-            # 📝 DESCRIÇÃO & OFERTA
-            # =========================
-            with tab_textos:
-                colX, colY = st.columns(2)
-                with colX:
-                    descf = st.text_area(DB_TO_LABEL["DESC_FORNECEDOR"], value=rec.get("DESC_FORNECEDOR") or "", height=180)
-                with colY:
-                    ofert = st.text_area(DB_TO_LABEL["OFERTA_FORNECEDOR"], value=rec.get("OFERTA_FORNECEDOR") or "", height=180)
-
-            st.markdown("---")
-            c1, c2, c3 = st.columns([1,1,1])
-            salvar = c1.form_submit_button("Salvar alterações", type="primary", use_container_width=True)
-            fechar = c2.form_submit_button("Fechar", use_container_width=True)
-            new_material = existing_mat  # padrão: mantém
-            if remove_mat:
-                new_material = None
-            elif up_new is not None:
-                new_material = _store_uploaded_file(up_new)  # salva e substitui
-            elif (mat_url or "").strip():
-                new_material = _normalize_url(mat_url.strip())  # substitui por URL
-
-            if fechar:
-                st.rerun()
-
-            if salvar:
-                if not nome.strip():
-                    st.error("Campo 'Fornecedor' é obrigatório.")
-                    return
-                updates = {
-                    "FORNECEDOR": nome.strip(),
-                    "CLASSIFICACAO": _classif_code_from_choice(classif),
-                    "CATEGORIA": cat,
-                    "AMBITO": amb,
-                    "SITE": site.strip() or None,
-                    "DESC_FORNECEDOR": descf.strip() or None,
-                    "OFERTA_FORNECEDOR": ofert.strip() or None,
-                    "PERIODICIDADE": peri.strip() or None,
-                    "DADOS_FORNECEDOR": dados.strip() or None,
-                    "CONTATO": cont.strip() or None,
-                    "STATUS": status.strip() or None,  # <- vem do selectbox
-                    "MATERIAL_APRESENTACAO": new_material,
-                    "NDA_ASSINADO_EM": nda_date.isoformat() if nda_date else None,
-                }
-                try:
-                    update_fornecedor(rec.get("ID"), updates)
-                    st.success("Fornecedor atualizado com sucesso!")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Erro ao atualizar: {e}")
-
-
-        st.markdown("#### Material de apresentação")
-
-        cur = (rec.get("MATERIAL_APRESENTACAO") or "").strip()
-        if not cur:
-            st.caption("Nenhum material cadastrado.")
-        elif _is_url(cur):
-            st.link_button("Abrir material (URL)", _normalize_url(cur), use_container_width=True, key=f"open_{rec_id}")
-        else:
-            p = Path(cur)
-            if p.exists():
-                with open(p, "rb") as fh:
-                    st.download_button(
-                        "Baixar material",
-                        fh.read(),
-                        file_name=p.name,
-                        use_container_width=True,
-                        key=f"dl_{rec_id}"
-                    )
-            else:
-                st.caption(f"Arquivo não encontrado: `{cur}`")
-    _dialog()   
-
-
-def open_create_dialog(default_categoria: str | None = None):
-    @st.dialog("Novo fornecedor", width="large")
-    def _dialog():
-        st.caption("Preencha os campos abaixo e clique em **Salvar**.")
-        colA, colB = st.columns(2)
-
-        with colA:
-            nome = st.text_input(DB_TO_LABEL["FORNECEDOR"], key="novo_FORNECEDOR")
-            classif = st.selectbox(
-                DB_TO_LABEL["CLASSIFICACAO"],
-                options=CLASSIFICACAO_CHOICES,
-                key="novo_CLASSIFICACAO"
-            )
-            cat = st.selectbox(
-                DB_TO_LABEL["CATEGORIA"],
-                [s for s in SETORES if s != "Todos"],
-                index=( [s for s in SETORES if s != "Todos"].index(default_categoria) 
-                        if default_categoria in SETORES and default_categoria != "Todos" else 0),
-                key="novo_CATEGORIA",
-            )
-            amb = st.selectbox(
-                DB_TO_LABEL["AMBITO"],
-                options=AMBITO_OPTIONS,
-                index=0,
-                key="novo_AMBITO"
-            )
-            site = st.text_area(DB_TO_LABEL["SITE"], key="novo_SITE", placeholder="ex: site1.com; site2.com")
-            status_options_new = [s for s in STATUSES if s != "Todos"]
-            status = st.selectbox(DB_TO_LABEL["STATUS"], options=status_options_new, index=0, key="novo_STATUS_SEL")
-
-        with colB:
-            descf = st.text_area(DB_TO_LABEL["DESC_FORNECEDOR"], key="novo_DESC_FORNECEDOR")
-            ofert = st.text_area(DB_TO_LABEL["OFERTA_FORNECEDOR"], key="novo_OFERTA_FORNECEDOR")
-            peri  = st.text_input(DB_TO_LABEL["PERIODICIDADE"], key="novo_PERIODICIDADE")
-            dados = st.text_area(DB_TO_LABEL["DADOS_FORNECEDOR"], key="novo_DADOS_FORNECEDOR")
-            cont  = st.text_area(DB_TO_LABEL["CONTATO"], key="novo_CONTATO", placeholder="email1@dominio; email2@dominio")
-
-            st.markdown("**NDA**")
-            nda_assinado_bool = st.checkbox("NDA assinado?", key="novo_NDA_BOOL")
-            if nda_assinado_bool:
-                nda_date = st.date_input(DB_TO_LABEL["NDA_ASSINADO_EM"], key="novo_NDA_ASSINADO_EM", value=date.today())
-            else:
-                nda_date = None
-
-            mat   = st.text_area(DB_TO_LABEL["MATERIAL_APRESENTACAO"], key="novo_MATERIAL_APRESENTACAO", placeholder="URL1; URL2")
-
-        c1, c2 = st.columns([1,1])
-        salvar = c1.button("Salvar", type="primary", use_container_width=True)
-        cancelar = c2.button("Cancelar", use_container_width=True)
-        
-        if cancelar:
-            st.rerun()
-
-        if salvar:
-            if not nome.strip():
-                st.error("Campo 'Fornecedor' é obrigatório.")
-                return
-            rec = {
-                "FORNECEDOR": nome.strip(),
-                "CLASSIFICACAO": _classif_code_from_choice(classif),
-                "CATEGORIA": cat,
-                "AMBITO": amb,
-                "SITE": site.strip() or None,
-                "DESC_FORNECEDOR": descf.strip() or None,
-                "OFERTA_FORNECEDOR": ofert.strip() or None,
-                "PERIODICIDADE": peri.strip() or None,
-                "DADOS_FORNECEDOR": dados.strip() or None,
-                "CONTATO": cont.strip() or None,
-                "STATUS": status.strip() or None,
-                "MATERIAL_APRESENTACAO": mat.strip() or None,
-                "NDA_ASSINADO_EM": nda_date.isoformat() if nda_date else None,
-            }
-            try:
-                insert_fornecedor(rec)
-                st.success("Fornecedor criado com sucesso!")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Erro ao salvar: {e}")
-
-    _dialog()
-
-# =========================
-# STATE & LOGIN
+# STATE & HOME
 # =========================
 def ensure_state():
     if "auth" not in st.session_state:
         st.session_state.auth = {"is_auth": False, "user": None}
-
-    # estado da aba Setor
-    if "view_setor" not in st.session_state:
-        st.session_state.view_setor = "select"  # "select" | "list"
-    if "filtro_setor_sel" not in st.session_state:
-        st.session_state.filtro_setor_sel = "Todos"
-
-    # estado da aba Status
-    if "view_status" not in st.session_state:
-        st.session_state.view_status = "select"  # "select" | "list"
-    if "filtro_status_sel" not in st.session_state:
-        st.session_state.filtro_status_sel = "Todos"
+    if "filter_segmento" not in st.session_state:
+        st.session_state.filter_segmento = "Todos"
+    if "upload_info" not in st.session_state:
+        st.session_state.upload_info = None  # {'file_name':..., 'sheet':...}
+    # estado da UI dos filtros por segmento: "select" (mostra botões) | "list" (mostra resultados + voltar)
+    if "segment_view" not in st.session_state:
+        st.session_state.segment_view = "select"
 
 ensure_state()
 
 def render_public_home():
     st.title("🏗️ Atuação de Prospecção de Dados — FGV IBRE")
     st.caption("Hub interno para prospecção de fornecedores de dados, parcerias e acompanhamentos de NDA.")
-
-    # Hero / resumo rápido
     st.markdown(
         """
-        **Prospecção Dados** centraliza o ciclo de prospecção de fornecedores:
-        - 📥 Importação de planilhas (.xlsx) padronizadas  
-        - 🗂️ Organização por **Setor** e **Status**  
-        - 🔎 Consulta rápida e abertura de **detalhes** por fornecedor  
-        - 📝 Registro de **NDA assinado** com data  
-        - 📎 Armazenamento de **materiais de apresentação**
-        """)
+        **Prospecção Dados** centraliza o ciclo de prospecção:
+        - 📥 Importação de planilhas (.xlsx)
+        - 🗂️ Filtro por **Segmento**
+        - 🔎 Cards com **detalhes em modal**
+        - 📝 **NDA / Datas** normalizadas (DD/MM/AAAA)
+        - 💬 **Status Atual com comentários** (admin)
+        - 🧠 Persistência no **DuckDB**
+        """
+    )
     st.divider()
 
+# =========================
+# HELPERS DE FORMATAÇÃO
+# =========================
+def _s(val):
+    """String segura: vazio/None/NaN/NaT -> '-'."""
+    if val is None:
+        return "-"
+    s = str(val).strip()
+    if s == "" or s.lower() in {"nan", "nat"}:
+        return "-"
+    return s
 
+def _fmt_bool(val):
+    if isinstance(val, str):
+        v = val.strip().lower()
+        if v in {"sim", "yes", "true", "1"}:
+            return "✅ Sim"
+        if v in {"não", "nao", "no", "false", "0"}:
+            return "❌ Não"
+    if isinstance(val, (bool, int)):
+        return "✅ Sim" if bool(val) else "❌ Não"
+    return _s(val)
+
+def _fmt_date(val):
+    """Normaliza datas variadas (inclui '2025-07-28 00:00:00') -> 'DD/MM/YYYY'; vazio -> '-'."""
+    if val is None:
+        return "-"
+    s = str(val).strip()
+    if s == "" or s.lower() in {"nan", "nat", "-"}:
+        return "-"
+    try:
+        if isinstance(val, (datetime, date)):
+            return val.strftime("%d/%m/%Y")
+        d = pd.to_datetime(s, errors="coerce", dayfirst=False)  # aceita 'YYYY-MM-DD HH:MM:SS'
+        if pd.notna(d):
+            return d.strftime("%d/%m/%Y")
+    except Exception:
+        pass
+    return _s(val)
+
+def _to_datetime(val):
+    """Converte string/data em datetime (NaT se inválido). Aceita 'DD/MM/YYYY' e 'YYYY-MM-DD HH:MM:SS'."""
+    if val is None:
+        return pd.NaT
+    s = str(val).strip()
+    if s == "" or s.lower() in {"nan", "nat", "-"}:
+        return pd.NaT
+    try:
+        return pd.to_datetime(s, errors="coerce", dayfirst=True)
+    except Exception:
+        return pd.NaT
+
+def _calc_status_like_excel(data_ass, inicio_renov, vigencia):
+    """Lógica do Excel:
+       DataAssinatura vazia -> EM NEGOCIAÇÃO
+       InícioRenov > hoje   -> EM VIGÊNCIA
+       InícioRenov < hoje e Vigência > hoje -> SOLICITAR RENOVAÇÃO
+       Vigência < hoje      -> ATRASADO
+       Senão -> '-'
+    """
+    today = pd.to_datetime(date.today())
+    da = _to_datetime(data_ass)
+    ir = _to_datetime(inicio_renov)
+    vg = _to_datetime(vigencia)
+
+    if pd.isna(da):
+        return "EM NEGOCIAÇÃO"
+    if pd.notna(ir) and ir > today:
+        return "EM VIGÊNCIA"
+    if (pd.notna(ir) and ir < today) and (pd.notna(vg) and vg > today):
+        return "SOLICITAR RENOVAÇÃO"
+    if pd.notna(vg) and vg < today:
+        return "ATRASADO"
+    return "-"
+
+# =========================
+# DUCKDB HELPERS
+# =========================
+def _connect():
+    return duckdb.connect(DB_PATH)
+
+def _ensure_tables():
+    con = _connect()
+    # Tabela principal
+    cols = [
+        'ID TEXT',
+        *(f'"{c}" TEXT' for c in EXPECTED_COLS),
+        'CREATED_AT TEXT',
+        'UPDATED_AT TEXT'
+    ]
+    con.execute(f'CREATE TABLE IF NOT EXISTS {TABLE_MAIN} ({", ".join(cols)});')
+    # Tabela de comentários
+    con.execute(f'''
+        CREATE TABLE IF NOT EXISTS {TABLE_COMMENTS} (
+            ID TEXT,
+            EMPRESA_ID TEXT,
+            USERNAME TEXT,
+            NAME TEXT,
+            MESSAGE TEXT,
+            CREATED_AT TEXT
+        );
+    ''')
+    con.close()
+
+def _import_replace_df(df: pd.DataFrame):
+    """Substitui todo o conteúdo da tabela principal pelo df informado."""
+    _ensure_tables()
+    df2 = df.copy()
+
+    # Garante todas as colunas esperadas
+    for c in EXPECTED_COLS:
+        if c not in df2.columns:
+            df2[c] = "-"
+
+    # Normaliza datas como texto DD/MM/YYYY
+    for dc in ["Data de Assinatura", "Início da Renovação da Assinatura", "Vigência"]:
+        if dc in df2.columns:
+            df2[dc] = df2[dc].apply(_fmt_date)
+
+    # Calcula Status conforme lógica do Excel (sobrescreve o que veio)
+    df2["Status"] = df2.apply(
+        lambda r: _calc_status_like_excel(
+            r.get("Data de Assinatura"), r.get("Início da Renovação da Assinatura"), r.get("Vigência")
+        ), axis=1
+    )
+
+    # Preenche vazios com '-'
+    df2 = df2.applymap(lambda v: "-" if (v is None or str(v).strip() in {"", "nan", "NaN", "NaT"}) else str(v).strip())
+
+    # Gera IDs e timestamps
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if "ID" not in df2.columns:
+        df2["ID"] = [uuid4().hex for _ in range(len(df2))]
+    if "CREATED_AT" not in df2.columns:
+        df2["CREATED_AT"] = now_str
+    if "UPDATED_AT" not in df2.columns:
+        df2["UPDATED_AT"] = now_str
+
+    # Reordena colunas: ID + EXPECTED + created/updated
+    cols_order = ["ID", *EXPECTED_COLS, "CREATED_AT", "UPDATED_AT"]
+    df2 = df2.reindex(columns=cols_order)
+
+    # Escreve (replace)
+    con = _connect()
+    con.execute(f"DELETE FROM {TABLE_MAIN};")
+    con.register("df_up", df2)
+    cols_q = ", ".join(f'"{c}"' for c in cols_order)
+    con.execute(f'INSERT INTO {TABLE_MAIN} ({cols_q}) SELECT {cols_q} FROM df_up;')
+    con.close()
+    return len(df2)
+
+def _fetch_df(segmento: str | None = None) -> pd.DataFrame:
+    _ensure_tables()
+    con = _connect()
+    try:
+        if segmento and segmento != "Todos":
+            df = con.execute(
+                f'SELECT * FROM {TABLE_MAIN} WHERE LOWER("Segmento") = LOWER(?) ORDER BY "Nome da Empresa";',
+                [segmento]
+            ).df()
+        else:
+            df = con.execute(f'SELECT * FROM {TABLE_MAIN} ORDER BY "Nome da Empresa";').df()
+    finally:
+        con.close()
+    return df
+
+def _update_record(rec_id: str, updates: dict):
+    """Atualiza campos do registro (por ID)."""
+    if not rec_id:
+        raise ValueError("ID obrigatório.")
+    if not updates:
+        return
+    _ensure_tables()
+    updates = {k: v for k, v in updates.items() if k in EXPECTED_COLS or k in {"CREATED_AT","UPDATED_AT"}}
+    updates["UPDATED_AT"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    set_clause = ", ".join([f'"{k}" = ?' for k in updates.keys()])
+    params = list(updates.values()) + [rec_id]
+    con = _connect()
+    con.execute(f'UPDATE {TABLE_MAIN} SET {set_clause} WHERE ID = ?;', params)
+    con.close()
+
+def _insert_comment(empresa_id: str, username: str, name: str, message: str):
+    if not message.strip():
+        return
+    _ensure_tables()
+    con = _connect()
+    con.execute(
+        f'INSERT INTO {TABLE_COMMENTS} (ID, EMPRESA_ID, USERNAME, NAME, MESSAGE, CREATED_AT) VALUES (?, ?, ?, ?, ?, ?);',
+        [uuid4().hex, empresa_id, username, name, message.strip(), datetime.now().strftime("%Y-%m-%d %H:%M:%S")]
+    )
+    con.close()
+
+def _fetch_comments(empresa_id: str) -> pd.DataFrame:
+    _ensure_tables()
+    con = _connect()
+    try:
+        df = con.execute(
+            f'SELECT * FROM {TABLE_COMMENTS} WHERE EMPRESA_ID = ? ORDER BY CREATED_AT DESC;',
+            [empresa_id]
+        ).df()
+    finally:
+        con.close()
+    return df
+
+# =========================
+# MODAL DE DETALHES (com abas + edição por role)
+# =========================
+def open_company_dialog(rec: dict, is_admin: bool, current_user: dict):
+    titulo = f"Detalhes — {_s(rec.get('Nome da Empresa'))}"
+
+    @st.dialog(titulo, width="large")
+    def _dialog():
+        st.caption(
+            f"Segmento: **{_s(rec.get('Segmento'))}** • "
+            f"CNPJ: **{_s(rec.get('CNPJ'))}** • "
+            f"Prioridade: **{_s(rec.get('Prioridade'))}**"
+        )
+        st.divider()
+
+        if is_admin:
+            # ========================
+            # FORM DE EDIÇÃO (SEM COMENTÁRIOS)
+            # ========================
+            with st.form(f"form_edit_{rec['ID']}"):
+                tab_geral, tab_datas, tab_prod, tab_contatos, tab_obs, tab_status = st.tabs(
+                    ["📌 Geral", "📅 Datas", "🧪 Produto/Cobertura",
+                     "🔗 Contatos & Docs", "🧭 Observações & Mercado",
+                     "🗒️ Status Atual & Comentários"]
+                )
+
+                with tab_geral:
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        prioridade = st.select_slider(
+                            "Prioridade (0 = sem prioridade, 3 = alta)",
+                            options=[0, 1, 2, 3],
+                            value=int(rec.get("Prioridade")) if _s(rec.get("Prioridade")).isdigit() else 0
+                        )
+                        situacao = st.text_input("Situação", value=_s(rec.get("Situação")))
+                        status = st.text_input("Status (calculado automaticamente ao salvar se datas mudarem)", value=_s(rec.get("Status")))
+                        status_atual = st.text_area("Status Atual (resumo)", value=_s(rec.get("Status Atual")), height=80)
+                        nda_ass = st.text_input("NDA Assinado", value=_s(rec.get("NDA Assinado")))
+                        aprov = st.text_input("Aprovação", value=_s(rec.get("Aprovação")))
+                    with col2:
+                        nome = st.text_input("Nome da Empresa", value=_s(rec.get("Nome da Empresa")))
+                        cnpj = st.text_input("CNPJ", value=_s(rec.get("CNPJ")))
+                        segmento = st.text_input("Segmento", value=_s(rec.get("Segmento")))
+                        relac = st.text_input("Relacionamento", value=_s(rec.get("Relacionamento")))
+                        auto = st.text_input("Automação", value=_s(rec.get("Automação")))
+                        doc = st.text_input("Documento", value=_s(rec.get("Documento")))
+
+                with tab_datas:
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        data_ass = st.text_input("Data de Assinatura (DD/MM/AAAA)", value=_s(rec.get("Data de Assinatura")))
+                    with col2:
+                        inicio_renov = st.text_input("Início da Renovação da Assinatura (DD/MM/AAAA)", value=_s(rec.get("Início da Renovação da Assinatura")))
+                    with col3:
+                        vigencia = st.text_input("Vigência (DD/MM/AAAA)", value=_s(rec.get("Vigência")))
+                    col4, col5, col6 = st.columns(3)
+                    with col4:
+                        val_anos = st.text_input("Validade em Anos", value=_s(rec.get("Validade em Anos")))
+                    with col5:
+                        val_meses = st.text_input("Validade em Meses", value=_s(rec.get("Validade em Meses")))
+                    with col6:
+                        val_dias = st.text_input("Validade em Dias", value=_s(rec.get("Validade em Dias")))
+
+                with tab_prod:
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        metodologia = st.text_area("Metodologia", value=_s(rec.get("Metodologia")), height=120)
+                        cobertura = st.text_area("Cobertura", value=_s(rec.get("Cobertura")), height=120)
+                        resumo = st.text_area("Resumo", value=_s(rec.get("Resumo")), height=120)
+                    with col2:
+                        descricao = st.text_area("Descrição", value=_s(rec.get("Descrição")), height=180)
+                        # OBS agora na aba Observações & Mercado
+
+                with tab_contatos:
+                    site = st.text_input("Site", value=_s(rec.get("Site")))
+                    contatos = st.text_area("Contatos", value=_s(rec.get("Contatos")), height=120)
+                    analise_tec = st.text_input("Analise técnica", value=_s(rec.get("Analise técnica")))
+
+                with tab_obs:
+                    obs = st.text_area("OBS", value=_s(rec.get("OBS")), height=120)
+                    pts_fortes = st.text_area("Pontos Fortes", value=_s(rec.get("Pontos Fortes")), height=100)
+                    pts_fracos = st.text_area("Pontos Fracos", value=_s(rec.get("Pontos Fracos")), height=100)
+                    conc = st.text_area("Concorrentes", value=_s(rec.get("Concorrentes")), height=100)
+
+                with tab_status:
+                    st.markdown("**Comentários:**")
+                    com_df = _fetch_comments(rec["ID"])
+                    if com_df.empty:
+                        st.caption("Sem comentários ainda.")
+                    else:
+                        for _, crow in com_df.iterrows():
+                            ts = _s(crow.get("CREATED_AT"))
+                            nm = _s(crow.get("NAME"))
+                            msg = _s(crow.get("MESSAGE"))
+                            st.markdown(f"🗨️ **{nm}** · _{ts}_")
+                            st.markdown(f"> {msg}")
+                            st.markdown("---")
+                    # ⛔️ Nada de input/checkbox aqui dentro do form.
+
+                save_btn = st.form_submit_button("💾 Salvar alterações", use_container_width=True)
+                if save_btn:
+                    data_ass_n = _fmt_date(data_ass)
+                    inicio_renov_n = _fmt_date(inicio_renov)
+                    vigencia_n = _fmt_date(vigencia)
+                    status_calc = _calc_status_like_excel(data_ass_n, inicio_renov_n, vigencia_n)
+
+                    updates = {
+                        "Prioridade": str(prioridade),
+                        "Situação": _s(situacao),
+                        "CNPJ": _s(cnpj),
+                        "Nome da Empresa": _s(nome),
+                        "Segmento": _s(segmento),
+                        "Descrição": _s(descricao),
+                        "Resumo": _s(resumo),
+                        "Metodologia": _s(metodologia),
+                        "Cobertura": _s(cobertura),
+                        "Site": _s(site),
+                        "Contatos": _s(contatos),
+                        "Data de Assinatura": data_ass_n,
+                        "Validade em Anos": _s(val_anos),
+                        "Validade em Meses": _s(val_meses),
+                        "Validade em Dias": _s(val_dias),
+                        "Início da Renovação da Assinatura": inicio_renov_n,
+                        "Vigência": vigencia_n,
+                        "Status": status_calc,
+                        "NDA Assinado": _s(nda_ass),
+                        "Documento": _s(doc),
+                        "Aprovação": _s(aprov),
+                        "Analise técnica": _s(analise_tec),
+                        "Relacionamento": _s(relac),
+                        "Automação": _s(auto),
+                        "OBS": _s(obs),
+                        "Pontos Fortes": _s(pts_fortes),
+                        "Pontos Fracos": _s(pts_fracos),
+                        "Concorrentes": _s(conc),
+                        "Status Atual": _s(status_atual),
+                    }
+                    try:
+                        _update_record(rec["ID"], updates)
+                        st.success("Registro atualizado com sucesso!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Erro ao salvar: {e}")
+
+            # ========================
+            # INPUT DE COMENTÁRIO (FORA DO FORM) — ENTER PARA ENVIAR
+            # ========================
+            st.markdown("---")
+            st.markdown("**Adicionar comentário (pressione Enter para enviar):**")
+
+            # callback que insere e limpa
+            def _submit_comment():
+                key = f"novo_coment_{rec['ID']}"
+                txt = st.session_state.get(key, "").strip()
+                if txt:
+                    _insert_comment(
+                        empresa_id=rec["ID"],
+                        username=current_user["username"],
+                        name=current_user["name"],
+                        message=txt
+                    )
+                    st.session_state[key] = ""  # limpa o campo
+                    st.rerun()
+
+            st.text_input(
+                "Comentário",
+                value="",
+                key=f"novo_coment_{rec['ID']}",
+                placeholder="Escreva seu comentário e pressione Enter",
+                on_change=_submit_comment,
+            )
+
+        else:
+            # VISUAL
+            tab_geral, tab_datas, tab_prod, tab_contatos, tab_obs, tab_status = st.tabs(
+                ["📌 Geral", "📅 Datas", "🧪 Produto/Cobertura",
+                 "🔗 Contatos & Docs", "🧭 Observações & Mercado",
+                 "🗒️ Status Atual & Comentários"]
+            )
+            with tab_geral:
+                st.markdown(f"- **Prioridade:** {_s(rec.get('Prioridade'))}")
+                st.markdown(f"- **Situação:** {_s(rec.get('Situação'))}")
+                st.markdown(f"- **Status:** {_s(rec.get('Status'))}")
+                st.markdown(f"- **Status Atual:** {_s(rec.get('Status Atual'))}")
+                st.markdown(f"- **Vigência:** {_s(rec.get('Vigência'))}")
+                st.markdown(f"- **NDA Assinado:** {_fmt_bool(rec.get('NDA Assinado'))}")
+                st.markdown(f"- **Aprovação:** {_s(rec.get('Aprovação'))}")
+                st.markdown(f"- **Analise técnica:** {_s(rec.get('Analise técnica'))}")
+                st.markdown(f"- **Relacionamento:** {_s(rec.get('Relacionamento'))}")
+                st.markdown(f"- **Automação:** {_s(rec.get('Automação'))}")
+            with tab_datas:
+                st.markdown(f"- **Data de Assinatura:** {_fmt_date(rec.get('Data de Assinatura'))}")
+                st.markdown(f"- **Início da Renovação da Assinatura:** {_fmt_date(rec.get('Início da Renovação da Assinatura'))}")
+                st.markdown(f"- **Validade (Anos/Meses/Dias):** {_s(rec.get('Validade em Anos'))} / {_s(rec.get('Validade em Meses'))} / {_s(rec.get('Validade em Dias'))}")
+            with tab_prod:
+                st.markdown(f"- **Metodologia:** {_s(rec.get('Metodologia'))}")
+                st.markdown(f"- **Cobertura:** {_s(rec.get('Cobertura'))}")
+                st.markdown(f"- **Descrição:** {_s(rec.get('Descrição'))}")
+                st.markdown(f"- **Resumo:** {_s(rec.get('Resumo'))}")
+            with tab_contatos:
+                site = _s(rec.get('Site'))
+                if site not in {"-", ""}:
+                    st.markdown(f"- **Site:** [{site}]({site})")
+                else:
+                    st.markdown(f"- **Site:** -")
+                st.markdown(f"- **Contatos:** {_s(rec.get('Contatos'))}")
+                st.markdown(f"- **Documento:** {_s(rec.get('Documento'))}")
+            with tab_obs:
+                st.markdown(f"- **OBS:** {_s(rec.get('OBS'))}")
+                st.markdown(f"- **Pontos Fortes:** {_s(rec.get('Pontos Fortes'))}")
+                st.markdown(f"- **Pontos Fracos:** {_s(rec.get('Pontos Fracos'))}")
+                st.markdown(f"- **Concorrentes:** {_s(rec.get('Concorrentes'))}")
+            with tab_status:
+                st.markdown(f"**Status Atual (resumo):** {_s(rec.get('Status Atual'))}")
+                st.markdown("---")
+                st.markdown("**Comentários:**")
+                com_df = _fetch_comments(rec["ID"])
+                if com_df.empty:
+                    st.caption("Sem comentários.")
+                else:
+                    for _, crow in com_df.iterrows():
+                        ts = _s(crow.get("CREATED_AT"))
+                        nm = _s(crow.get("NAME"))
+                        msg = _s(crow.get("MESSAGE"))
+                        st.markdown(f"🗨️ **{nm}** · _{ts}_")
+                        st.markdown(f"> {msg}")
+                        st.markdown("---")
+
+    _dialog()
+
+# =========================
+# SIDEBAR (LOGIN + UPLOAD)
+# =========================
 with st.sidebar:
     st.subheader("🔐 Acesso")
     if not st.session_state.auth["is_auth"]:
         with st.form("login_form"):
-            username = st.text_input("Usuário", placeholder="ex: yago")
+            username = st.text_input("Usuário", placeholder="ex: spdo_nome")
             password = st.text_input("Senha", type="password")
             ok = st.form_submit_button("Entrar", use_container_width=True)
             if ok:
@@ -611,174 +533,269 @@ with st.sidebar:
             ensure_state()
             st.rerun()
 
-    # -------- Importar Excel (na sidebar) --------
     if st.session_state.auth["is_auth"]:
         st.markdown("---")
         st.markdown("### 📄 Importar Excel")
-        uploaded = st.file_uploader("Selecione um .xlsx (aba 'Dados')", type=["xlsx"], key="uploader_xlsx_sidebar")
+        uploaded = st.file_uploader("Selecione um .xlsx", type=["xlsx"], key="uploader_xlsx_sidebar")
+
         if uploaded:
             try:
                 xls = pd.ExcelFile(uploaded, engine="openpyxl")
-                if "Dados" not in xls.sheet_names:
-                    st.error(f"Aba 'Dados' não encontrada. Abas: {', '.join(xls.sheet_names)}")
-                else:
-                    df_raw = pd.read_excel(xls, sheet_name="Dados", dtype=str)
-                    df_raw.columns = df_raw.columns.map(lambda c: str(c).strip())
+                sheet_names = xls.sheet_names
+                chosen_sheet = "Dados" if "Dados" in sheet_names else sheet_names[0]
 
-                    present = [c for c in df_raw.columns if c in EXCEL_TO_DB]
-                    missing = [c for c in EXCEL_TO_DB if c not in df_raw.columns]
+                df_view = pd.read_excel(xls, sheet_name=chosen_sheet, dtype=str)
+                df_view.columns = df_view.columns.map(lambda c: str(c).strip())
 
-                    df_db = df_raw.rename(columns=EXCEL_TO_DB)[[EXCEL_TO_DB[c] for c in present]]
-                    for miss in missing:
-                        df_db[EXCEL_TO_DB[miss]] = None
-                    # injeta colunas extras e reordena:
-                    if "ID" not in df_db.columns:
-                        df_db["ID"] = [str(uuid4()) for _ in range(len(df_db))]
-                    df_db["NDA_ASSINADO_EM"] = None
-                    df_db = df_db.reindex(columns=DB_COL_ORDER)
+                # Garante colunas esperadas
+                for c in EXPECTED_COLS:
+                    if c not in df_view.columns:
+                        df_view[c] = "-"
 
-                    if "CLASSIFICACAO" in df_db.columns:
-                        df_db["CLASSIFICACAO"] = df_db["CLASSIFICACAO"].apply(_classif_to_code)
-                    if "AMBITO" in df_db.columns:
-                        df_db["AMBITO"] = df_db["AMBITO"].apply(_ambito_norm)
+                # Normalizações de datas (para exibição e status)
+                for dc in ["Data de Assinatura", "Início da Renovação da Assinatura", "Vigência"]:
+                    if dc in df_view.columns:
+                        df_view[dc] = df_view[dc].apply(_fmt_date)
 
-                    with st.spinner("Importando para DuckDB..."):
-                        n = import_to_duckdb(df_db)
-                    st.success(f"Importação concluída! {n} registros gravados.")
-                    if missing:
-                        st.info("Colunas ausentes preenchidas como vazio: " + ", ".join(missing))
+                # Calcula Status conforme a lógica do Excel
+                df_view["Status"] = df_view.apply(
+                    lambda r: _calc_status_like_excel(
+                        r.get("Data de Assinatura"), r.get("Início da Renovação da Assinatura"), r.get("Vigência")
+                    ), axis=1
+                )
+
+                # Vazio -> "-"
+                df_view = df_view.applymap(lambda v: "-" if (v is None or str(v).strip() in {"", "nan", "NaN", "NaT"}) else str(v).strip())
+
+                # Persiste no DuckDB (substitui tudo)
+                n = _import_replace_df(df_view)
+
+                st.session_state.upload_info = {"file_name": uploaded.name, "sheet": chosen_sheet, "rows": n}
+                st.success(f"Importação concluída: {n} linha(s) para a aba '{chosen_sheet}'.")
+                st.rerun()
             except Exception as e:
                 st.error(f"Não foi possível ler o XLSX. Detalhes: {e}")
 
 # Somente login
 if not st.session_state.auth["is_auth"]:
-    render_public_home()   # ← mostra a home explicativa
+    render_public_home()
     st.stop()
+
+def _insert_record_main(record: dict) -> str:
+    """Insere UMA empresa na tabela principal e retorna o ID."""
+    _ensure_tables()
+
+    # Monta linha com todas as colunas esperadas
+    row = {c: _s(record.get(c)) for c in EXPECTED_COLS}
+
+    # Normaliza datas (DD/MM/AAAA)
+    for dc in ["Data de Assinatura", "Início da Renovação da Assinatura", "Vigência"]:
+        row[dc] = _fmt_date(row.get(dc))
+
+    # Calcula Status pela lógica estilo Excel
+    row["Status"] = _calc_status_like_excel(
+        row.get("Data de Assinatura"),
+        row.get("Início da Renovação da Assinatura"),
+        row.get("Vigência"),
+    )
+
+    # Campos obrigatórios adicionais
+    rec_id = uuid4().hex
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Preenche vazios com '-'
+    row = {
+        k: ("-" if (v is None or str(v).strip() in {"", "nan", "NaN", "NaT"})
+            else str(v).strip())
+        for k, v in row.items()
+    }
+
+    # Monta SQL (sem f-string aninhada)
+    cols_order = ["ID", *EXPECTED_COLS, "CREATED_AT", "UPDATED_AT"]
+    cols_sql = ", ".join([f'"{c}"' for c in cols_order])  # <- monta fora
+    placeholders = ", ".join(["?"] * len(cols_order))
+    params = [rec_id, *[row[c] for c in EXPECTED_COLS], now_str, now_str]
+
+    con = _connect()
+    con.execute(f'INSERT INTO {TABLE_MAIN} ({cols_sql}) VALUES ({placeholders});', params)
+    con.close()
+    return rec_id
+
+
+def open_create_dialog(default_segmento: str | None, current_user: dict):
+    """Modal para criar nova empresa (admin)."""
+    @st.dialog("✚ Nova empresa", width="large")
+    def _dialog():
+        st.caption("Preencha os campos e clique em **Salvar**.")
+        with st.form("form_nova_empresa"):
+            # Mesma estrutura de abas do detalhamento
+            tab_geral, tab_datas, tab_prod, tab_contatos, tab_obs = st.tabs(
+                ["📌 Geral", "📅 Datas", "🧪 Produto/Cobertura", "🔗 Contatos & Docs", "🧭 Observações & Mercado"]
+            )
+
+            with tab_geral:
+                col1, col2 = st.columns(2)
+                with col1:
+                    nome = st.text_input("Nome da Empresa", value="")
+                    cnpj = st.text_input("CNPJ", value="")
+                    segmento_opts = [s for s in SEGMENT_FILTERS if s != "Todos"]
+                    seg_default = default_segmento if default_segmento in segmento_opts else segmento_opts[0]
+                    segmento = st.selectbox("Segmento", options=segmento_opts, index=segmento_opts.index(seg_default))
+                    prioridade = st.select_slider("Prioridade (0 = sem prioridade, 3 = alta)", options=[0, 1, 2, 3], value=0)
+                    situacao = st.text_input("Situação", value="-")
+                    status_atual = st.text_area("Status Atual (resumo)", value="-", height=80)
+                with col2:
+                    nda_ass = st.text_input("NDA Assinado", value="-")
+                    aprov = st.text_input("Aprovação", value="-")
+                    relac = st.text_input("Relacionamento", value="-")
+                    auto = st.text_input("Automação", value="-")
+                    doc = st.text_input("Documento", value="-")
+
+            with tab_datas:
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    data_ass = st.text_input("Data de Assinatura (DD/MM/AAAA)", value="-")
+                with col2:
+                    inicio_renov = st.text_input("Início da Renovação da Assinatura (DD/MM/AAAA)", value="-")
+                with col3:
+                    vigencia = st.text_input("Vigência (DD/MM/AAAA)", value="-")
+                col4, col5, col6 = st.columns(3)
+                with col4:
+                    val_anos = st.text_input("Validade em Anos", value="-")
+                with col5:
+                    val_meses = st.text_input("Validade em Meses", value="-")
+                with col6:
+                    val_dias = st.text_input("Validade em Dias", value="-")
+
+            with tab_prod:
+                col1, col2 = st.columns(2)
+                with col1:
+                    metodologia = st.text_area("Metodologia", value="-", height=100)
+                    cobertura = st.text_area("Cobertura", value="-", height=100)
+                    resumo = st.text_area("Resumo", value="-", height=100)
+                with col2:
+                    descricao = st.text_area("Descrição", value="-", height=160)
+                    # OBS foi movido para a aba Observações & Mercado
+
+            with tab_contatos:
+                site = st.text_input("Site", value="-")
+                contatos = st.text_area("Contatos", value="-", height=80)
+                analise_tec = st.text_input("Analise técnica", value="-")
+                # Pontos Fortes/Fracos/Concorrentes foram movidos para a aba Observações & Mercado
+
+            # >>> Aba Observações & Mercado (agora com campos)
+            with tab_obs:
+                obs = st.text_area("OBS", value="-", height=100)
+                pts_fortes = st.text_area("Pontos Fortes", value="-", height=80)
+                pts_fracos = st.text_area("Pontos Fracos", value="-", height=80)
+                conc = st.text_area("Concorrentes", value="-", height=80)
+
+            save = st.form_submit_button("💾 Salvar empresa", type="primary", use_container_width=True)
+
+            if save:
+                if not nome.strip():
+                    st.error("O campo **Nome da Empresa** é obrigatório.")
+                    return
+
+                record = {
+                    "Prioridade": str(prioridade),
+                    "Situação": _s(situacao),
+                    "CNPJ": _s(cnpj),
+                    "Nome da Empresa": _s(nome),
+                    "Segmento": _s(segmento),
+                    "Descrição": _s(descricao),
+                    "Resumo": _s(resumo),
+                    "Metodologia": _s(metodologia),
+                    "Cobertura": _s(cobertura),
+                    "Site": _s(site),
+                    "Contatos": _s(contatos),
+                    "Data de Assinatura": _s(data_ass),
+                    "Validade em Anos": _s(val_anos),
+                    "Validade em Meses": _s(val_meses),
+                    "Validade em Dias": _s(val_dias),
+                    "Início da Renovação da Assinatura": _s(inicio_renov),
+                    "Vigência": _s(vigencia),
+                    "Status": "-",  # será recalculado no insert
+                    "NDA Assinado": _s(nda_ass),
+                    "Documento": _s(doc),
+                    "Aprovação": _s(aprov),
+                    "Analise técnica": _s(analise_tec),
+                    "Relacionamento": _s(relac),
+                    "Automação": _s(auto),
+                    # Observações & Mercado
+                    "OBS": _s(obs),
+                    "Pontos Fortes": _s(pts_fortes),
+                    "Pontos Fracos": _s(pts_fracos),
+                    "Concorrentes": _s(conc),
+                    # Status atual
+                    "Status Atual": _s(status_atual),
+                }
+
+                try:
+                    new_id = _insert_record_main(record)
+                    st.success("Empresa criada com sucesso!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Erro ao criar empresa: {e}")
+
+    _dialog()
 
 # =========================
 # CONTEÚDO PRINCIPAL
 # =========================
-df_all = load_fornecedores_df()
+user = st.session_state.auth["user"]
+is_admin = (user["role"] == "admin")
 
 st.title("🏗️ Atuação de Prospecção de Dados")
 
-# Função utilitária para renderizar os cards
-def render_cards(df_view: pd.DataFrame, titulo_lista: str, key_prefix: str):
-    st.markdown("---")
-    if df_view.empty:
-        if df_all.empty:
-            st.info("Nenhum fornecedor encontrado. Importe um Excel pela barra lateral.")
-        else:
-            st.warning(f"Nenhum fornecedor para o filtro selecionado em: {titulo_lista}.")
-        return
+# ====== Filtros por Segmento (com modo seleção/lista) ======
+if st.session_state.segment_view == "select":
+    st.subheader("Filtros por Segmento")
+    bt_cols = st.columns(len(SEGMENT_FILTERS))
+    for i, seg in enumerate(SEGMENT_FILTERS):
+        with bt_cols[i]:
+            if st.button(seg, use_container_width=True, key=f"seg-{seg}"):
+                st.session_state.filter_segmento = seg
+                st.session_state.segment_view = "list"
+                st.rerun()
+    st.caption("Escolha um segmento para visualizar os resultados.")
+    st.stop()  # não mostra lista enquanto não escolher um filtro
 
-    st.caption(f"{len(df_view)} fornecedor(es) em “{titulo_lista}”.")
+# Modo LISTA (mostra resultados do filtro + botão Voltar)
+st.subheader(f"Resultados — Segmento: {st.session_state.filter_segmento}")
+c_voltar, c_novo = st.columns(2)
+with c_voltar:
+    if st.button("⬅️ Voltar aos filtros", use_container_width=True, key="btn-voltar-segmentos"):
+        st.session_state.segment_view = "select"
+        st.session_state.filter_segmento = "Todos"
+        st.rerun()
+
+with c_novo:
+    if is_admin and st.button("✚ Criar empresa", use_container_width=True, key="btn-criar-empresa"):
+        # Passa o segmento atual (exceto "Todos") como padrão
+        default_seg = st.session_state.filter_segmento if st.session_state.filter_segmento != "Todos" else None
+        open_create_dialog(default_segmento=default_seg, current_user=user)
+
+st.divider()
+
+# Carrega do DB conforme filtro atual
+df_all = _fetch_df(st.session_state.filter_segmento)
+
+if df_all.empty:
+    st.info("Nenhum registro encontrado. Importe um Excel na barra lateral.")
+else:
+    st.caption(f"{len(df_all)} registro(s). Clique em um card para ver detalhes.")
     cols = st.columns(3)
-    for i in range(len(df_view)):
+    for i, (_, row) in enumerate(df_all.iterrows()):
         with cols[i % 3]:
             with st.container(border=True):
-                rec = df_view.iloc[i].to_dict()
-                nome = rec.get("FORNECEDOR") or "—"
-                status = rec.get("STATUS") or "—"
-                categoria = rec.get("CATEGORIA") or "—"
-                ambito = rec.get("AMBITO") or "—"
-                nda_info = rec.get("NDA_ASSINADO_EM") or "—"
-
+                nome = _s(row.get("Nome da Empresa"))
+                seg  = _s(row.get("Segmento"))
+                stat = _s(row.get("Status"))
+                vig  = _s(row.get("Vigência"))
+                prio = _s(row.get("Prioridade"))
                 st.markdown(f"### {nome}")
-                st.caption(f"Status: **{status}**")
-                st.caption(f"Categoria: **{categoria}** • Âmbito: **{ambito}**")
-                st.caption(f"NDA: **{nda_info}**")
-
-                rec_id = rec.get("ID") or f"{_slug(titulo_lista)}-{i}"
-                # Prefixo de aba + id + índice => chave única global
-                if st.button("Ver detalhes", key=f"{key_prefix}-det-{rec_id}-{i}", use_container_width=True):
-                    open_details_dialog(rec)
-
-# ======= Abas: Por Setor | Por Status =======
-tab_setor, tab_status = st.tabs(["🔎 Filtro por Setor", "✅ Filtro por Status"])
-
-with tab_setor:
-    st.subheader("Filtrar por setor:")
-    st.caption("Selecione um setor abaixo para ver os fornecedores.")
-
-    # Botão CRIAR novo (logo abaixo do subtexto)
-    st.button(
-        "✚ Criar novo fornecedor",
-        key="btn-create-setor",
-        type="primary",                # deixa texto/ícone (➕) em branco
-        use_container_width=True,
-        on_click=lambda: open_create_dialog(None if st.session_state.filtro_setor_sel == "Todos" else st.session_state.filtro_setor_sel),
-    )
-
-    st.markdown("")  # pequeno respiro visual
-
-    if st.session_state.view_setor == "select":
-        # === Modo SELEÇÃO: mostrar botões de setores ===
-        btn_cols = st.columns(3)
-        for i, setor in enumerate(SETORES):
-            with btn_cols[i % 3]:
-                if st.button(setor, use_container_width=True, key=f"setor-{i}"):
-                    st.session_state.filtro_setor_sel = setor
-                    st.session_state.view_setor = "list"
-                    st.rerun()
-    else:
-        # === Modo LISTA: mostrar resultado + botão Voltar ===
-        setor_sel = st.session_state.filtro_setor_sel
-        c1, = st.columns(1)
-        if c1.button("⬅️ Voltar aos setores", key="voltar-setor", use_container_width=True):
-            st.session_state.view_setor = "select"
-            st.rerun()
-
-        # Aplica filtro por setor
-        if setor_sel == "Todos":
-            df_view = df_all.copy()
-        else:
-            def _norm_local(s):
-                return "" if s is None else str(s).strip().casefold()
-            df_view = df_all[df_all["CATEGORIA"].apply(_norm_local) == _norm_local(setor_sel)].copy()
-
-        render_cards(df_view, f"Setor: {setor_sel}", key_prefix=f"setor-{_slug(setor_sel)}")
-
-
-with tab_status:
-    st.subheader("Filtrar por status:")
-    st.caption("Selecione um status abaixo para ver os fornecedores.")
-
-    # Botão CRIAR novo (logo abaixo do subtexto)
-    st.button(
-        "✚ Criar novo fornecedor",
-        key="btn-create-status",
-        type="primary",               # texto/ícone branco
-        use_container_width=True,
-        on_click=lambda: open_create_dialog(None),
-    )
-
-    st.markdown("")
-
-    if st.session_state.view_status == "select":
-        # === Modo SELEÇÃO: mostrar botões de status ===
-        btn_cols2 = st.columns(3)
-        for i, stt in enumerate(STATUSES):
-            with btn_cols2[i % 3]:
-                if st.button(stt, use_container_width=True, key=f"status-{i}"):
-                    st.session_state.filtro_status_sel = stt
-                    st.session_state.view_status = "list"
-                    st.rerun()
-    else:
-        # === Modo LISTA: mostrar resultado + botão Voltar ===
-        status_sel = st.session_state.filtro_status_sel
-        c2, = st.columns(1)
-        if c2.button("⬅️ Voltar aos status", key="voltar-status", use_container_width=True):
-            st.session_state.view_status = "select"
-            st.rerun()
-
-        # Aplica filtro por status — EXATO (sem normalização)
-        if status_sel == "Todos":
-            df_view_status = df_all.copy()
-        else:
-            df_view_status = df_all[
-                (df_all["STATUS"].fillna("").apply(lambda x: x.strip()) == status_sel.strip())
-            ].copy()
-
-        render_cards(df_view_status, f"Status: {status_sel}", key_prefix=f"status-{_slug(status_sel)}")
-
+                st.caption(f"Segmento: **{seg}** • Status: **{stat}**")
+                st.caption(f"Vigência: **{vig}** • Prioridade: **{prio}**")
+                if st.button("Ver detalhes", key=f"btn-det-{row['ID']}", use_container_width=True):
+                    open_company_dialog(row.to_dict(), is_admin=is_admin, current_user=user)
