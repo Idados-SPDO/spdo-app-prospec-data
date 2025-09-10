@@ -2,11 +2,10 @@
 import streamlit as st
 import pandas as pd
 import duckdb
-import re
 from uuid import uuid4
 from datetime import date, datetime
-from pathlib import Path
-import os
+import unicodedata
+
 
 # =========================
 # CONFIG
@@ -39,8 +38,63 @@ EXPECTED_COLS = [
 ]
 
 # Segmentos para filtro
-SEGMENT_FILTERS = ["Todos", "SOLUÇÃO", "FORNECEDOR DE DADOS", "DADOS", "POTENCIAIS NOVOS NEGÓCIOS"]
+SEGMENT_FILTERS = ["Todos", "Fornecedor de Soluções", "Fornecedor de Dados", "Potenciais Novos Negócios","Sem Segmento"]
+SEGMENT_OPTIONS = [s for s in SEGMENT_FILTERS if s != "Todos"]
+SEG_CANON_MAP = {
+    "fornecedor de solucoes": "Fornecedor de Soluções",
+    "fornecedor de soluções": "Fornecedor de Soluções",
+    "fornecedor de dados": "Fornecedor de Dados",
+    "potenciais novos negocios": "Potenciais Novos Negócios",
+    "potenciais novos negócios": "Potenciais Novos Negócios",
+    "sem segmento": "Sem Segmento",
+}
 
+def _deaccent_lower(s: str) -> str:
+    s = str(s).strip().lower()
+    s = unicodedata.normalize("NFD", s)
+    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+    return s
+
+SEG_ORDER = {seg: i for i, seg in enumerate(SEGMENT_OPTIONS)}
+
+def normalize_segments(val) -> list[str]:
+    """
+    Converte o conteúdo da célula "Segmento" em lista de segmentos canônicos.
+    - vazio/None/'-': ['Sem Segmento']
+    - 'A, B' -> ['A', 'B'] (canônicos)
+    - tokens inválidos são ignorados; se nada sobrar -> ['Sem Segmento']
+    """
+    if val is None:
+        return ["Sem Segmento"]
+    s = str(val).strip()
+    if s == "" or s in {"-", "nan", "NaN"}:
+        return ["Sem Segmento"]
+
+    toks = [t.strip() for t in s.split(",")]
+    out = []
+    for t in toks:
+        if not t:
+            continue
+        key = _deaccent_lower(t)
+        canon = SEG_CANON_MAP.get(key)
+        if canon:
+            out.append(canon)
+        else:
+            # Se veio um nome fora do dicionário, tente casar literalmente com uma das opções (case-insensitive)
+            for opt in SEGMENT_OPTIONS:
+                if _deaccent_lower(opt) == key:
+                    canon = opt
+                    break
+            if canon:
+                out.append(canon)
+            # Caso contrário, ignora silenciosamente
+    out = sorted(set(out), key=lambda x: SEG_ORDER.get(x, 999))
+    return out or ["Sem Segmento"]
+
+def segments_to_str(segments: list[str]) -> str:
+    # Persiste em texto "A, B" (ordem canônica)
+    segs = sorted(set(segments), key=lambda x: SEG_ORDER.get(x, 999))
+    return ", ".join(segs)
 # =========================
 # STATE & HOME
 # =========================
@@ -198,7 +252,11 @@ def _import_replace_df(df: pd.DataFrame):
             r.get("Data de Assinatura"), r.get("Início da Renovação da Assinatura"), r.get("Vigência")
         ), axis=1
     )
-
+    
+    if "Segmento" in df2.columns:
+        df2["Segmento"] = df2["Segmento"].apply(lambda v: segments_to_str(normalize_segments(v)))
+    else:
+        df2["Segmento"] = segments_to_str(["Sem Segmento"])
     # Preenche vazios com '-'
     df2 = df2.applymap(lambda v: "-" if (v is None or str(v).strip() in {"", "nan", "NaN", "NaT"}) else str(v).strip())
 
@@ -228,16 +286,20 @@ def _fetch_df(segmento: str | None = None) -> pd.DataFrame:
     _ensure_tables()
     con = _connect()
     try:
-        if segmento and segmento != "Todos":
-            df = con.execute(
-                f'SELECT * FROM {TABLE_MAIN} WHERE LOWER("Segmento") = LOWER(?) ORDER BY "Nome da Empresa";',
-                [segmento]
-            ).df()
-        else:
-            df = con.execute(f'SELECT * FROM {TABLE_MAIN} ORDER BY "Nome da Empresa";').df()
+        df = con.execute(f'SELECT * FROM {TABLE_MAIN} ORDER BY "Nome da Empresa";').df()
     finally:
         con.close()
-    return df
+
+    # cria uma coluna auxiliar com a lista de segmentos
+    if "Segmento" not in df.columns:
+        df["Segmento"] = "-"
+
+    df["_segments"] = df["Segmento"].apply(normalize_segments)
+
+    if segmento and segmento != "Todos":
+        df = df[df["_segments"].apply(lambda lst: segmento in lst)]
+
+    return df.drop(columns=["_segments"], errors="ignore")
 
 def _update_record(rec_id: str, updates: dict):
     """Atualiza campos do registro (por ID)."""
@@ -307,9 +369,10 @@ def open_company_dialog(rec: dict, is_admin: bool, current_user: dict):
                     col1, col2 = st.columns(2)
                     with col1:
                         prioridade = st.select_slider(
-                            "Prioridade (0 = sem prioridade, 3 = alta)",
+                            "Prioridade (0 = mais alta, 3 = menos)",
                             options=[0, 1, 2, 3],
-                            value=int(rec.get("Prioridade")) if _s(rec.get("Prioridade")).isdigit() else 0
+                            value=int(rec.get("Prioridade")) if _s(rec.get("Prioridade")).isdigit() else 3,
+                            format_func=lambda x: {0: "0 (mais alta)", 1: "1", 2: "2", 3: "3 (menos)"}.get(x, str(x)),
                         )
                         situacao = st.text_input("Situação", value=_s(rec.get("Situação")))
                         status = st.text_input("Status (calculado automaticamente ao salvar se datas mudarem)", value=_s(rec.get("Status")))
@@ -319,7 +382,8 @@ def open_company_dialog(rec: dict, is_admin: bool, current_user: dict):
                     with col2:
                         nome = st.text_input("Nome da Empresa", value=_s(rec.get("Nome da Empresa")))
                         cnpj = st.text_input("CNPJ", value=_s(rec.get("CNPJ")))
-                        segmento = st.text_input("Segmento", value=_s(rec.get("Segmento")))
+                        seg_pre = normalize_segments(rec.get("Segmento"))
+                        segmentos_ms = st.multiselect("Segmentos", options=SEGMENT_OPTIONS, default=seg_pre)
                         relac = st.text_input("Relacionamento", value=_s(rec.get("Relacionamento")))
                         auto = st.text_input("Automação", value=_s(rec.get("Automação")))
                         doc = st.text_input("Documento", value=_s(rec.get("Documento")))
@@ -388,7 +452,7 @@ def open_company_dialog(rec: dict, is_admin: bool, current_user: dict):
                         "Situação": _s(situacao),
                         "CNPJ": _s(cnpj),
                         "Nome da Empresa": _s(nome),
-                        "Segmento": _s(segmento),
+                        "Segmento": segments_to_str(segmentos_ms),
                         "Descrição": _s(descricao),
                         "Resumo": _s(resumo),
                         "Metodologia": _s(metodologia),
@@ -414,6 +478,9 @@ def open_company_dialog(rec: dict, is_admin: bool, current_user: dict):
                         "Concorrentes": _s(conc),
                         "Status Atual": _s(status_atual),
                     }
+                    if not segmentos_ms:
+                        st.error("Selecione pelo menos **um Segmento**.")
+                        return
                     try:
                         _update_record(rec["ID"], updates)
                         st.success("Registro atualizado com sucesso!")
@@ -638,9 +705,8 @@ def open_create_dialog(default_segmento: str | None, current_user: dict):
                 with col1:
                     nome = st.text_input("Nome da Empresa", value="")
                     cnpj = st.text_input("CNPJ", value="")
-                    segmento_opts = [s for s in SEGMENT_FILTERS if s != "Todos"]
-                    seg_default = default_segmento if default_segmento in segmento_opts else segmento_opts[0]
-                    segmento = st.selectbox("Segmento", options=segmento_opts, index=segmento_opts.index(seg_default))
+                    segmento_ms_default = [default_segmento] if default_segmento in SEGMENT_OPTIONS else []
+                    segmentos_ms = st.multiselect("Segmentos", options=SEGMENT_OPTIONS, default=segmento_ms_default)
                     prioridade = st.select_slider("Prioridade (0 = sem prioridade, 3 = alta)", options=[0, 1, 2, 3], value=0)
                     situacao = st.text_input("Situação", value="-")
                     status_atual = st.text_area("Status Atual (resumo)", value="-", height=80)
@@ -650,6 +716,7 @@ def open_create_dialog(default_segmento: str | None, current_user: dict):
                     relac = st.text_input("Relacionamento", value="-")
                     auto = st.text_input("Automação", value="-")
                     doc = st.text_input("Documento", value="-")
+
 
             with tab_datas:
                 col1, col2, col3 = st.columns(3)
@@ -691,7 +758,9 @@ def open_create_dialog(default_segmento: str | None, current_user: dict):
                 conc = st.text_area("Concorrentes", value="-", height=80)
 
             save = st.form_submit_button("💾 Salvar empresa", type="primary", use_container_width=True)
-
+            if not segmentos_ms:
+                st.error("Selecione pelo menos **um Segmento**.")
+                return
             if save:
                 if not nome.strip():
                     st.error("O campo **Nome da Empresa** é obrigatório.")
@@ -702,7 +771,7 @@ def open_create_dialog(default_segmento: str | None, current_user: dict):
                     "Situação": _s(situacao),
                     "CNPJ": _s(cnpj),
                     "Nome da Empresa": _s(nome),
-                    "Segmento": _s(segmento),
+                    "Segmento": segments_to_str(segmentos_ms),
                     "Descrição": _s(descricao),
                     "Resumo": _s(resumo),
                     "Metodologia": _s(metodologia),
@@ -790,7 +859,7 @@ else:
         with cols[i % 3]:
             with st.container(border=True):
                 nome = _s(row.get("Nome da Empresa"))
-                seg  = _s(row.get("Segmento"))
+                seg  = segments_to_str(normalize_segments(row.get("Segmento")))
                 stat = _s(row.get("Status"))
                 vig  = _s(row.get("Vigência"))
                 prio = _s(row.get("Prioridade"))
