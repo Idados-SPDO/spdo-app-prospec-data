@@ -6,6 +6,7 @@ from datetime import date, datetime
 import unicodedata
 import hashlib
 from snowflake.snowpark import Session
+from io import BytesIO
 
 # =========================
 # CONFIG
@@ -265,6 +266,41 @@ def _calc_status_like_excel(data_ass, inicio_renov, vigencia):
     if pd.notna(vg) and vg < today:
         return "ATRASADO"
     return "-"
+
+def _build_export_df(pdf: pd.DataFrame) -> pd.DataFrame:
+    """Prepara DataFrame só com os dados de empresas (sem comentários)."""
+    if pdf.empty:
+        return pdf
+
+    # Mantém apenas as colunas esperadas (na ordem)
+    cols = [c for c in EXPECTED_COLS if c in pdf.columns]
+    out = pdf[cols].copy()
+
+    # Normaliza segmento e formata datas para DD/MM/AAAA
+    if "SEGMENTO" in out.columns:
+        out["SEGMENTO"] = out["SEGMENTO"].apply(lambda v: segments_to_str(normalize_segments(v)))
+    for dc in DATE_COLS:
+        if dc in out.columns:
+            out[dc] = out[dc].apply(_fmt_date)
+
+    # Renomeia para rótulos amigáveis
+    out.rename(columns=LABEL, inplace=True)
+    return out
+
+def _df_to_xlsx_bytes(df: pd.DataFrame) -> bytes:
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
+        df.to_excel(writer, index=False, sheet_name="Empresas")
+        # Ajuste simples de largura de coluna
+        ws = writer.sheets["Empresas"]
+        for i, col in enumerate(df.columns):
+            try:
+                w = int(min(40, max(12, df[col].astype(str).str.len().quantile(0.9) + 2)))
+            except Exception:
+                w = 18
+            ws.set_column(i, i, w)
+    buf.seek(0)
+    return buf.getvalue()
 
 # =========================
 # HELPERS (SNOWFLAKE)
@@ -943,3 +979,30 @@ else:
                 st.caption(f"Vigência: **{vig}** • Prioridade: **{prio}**")
                 if st.button("Ver detalhes", key=f"btn-det-{row['ID']}", use_container_width=True):
                     open_company_dialog(row.to_dict(), is_admin=is_admin, current_user=user)
+# Carrega do DB conforme filtro atual
+df_all = _fetch_df(st.session_state.filter_segmento)
+
+# === Botões de download (XLSX/CSV) ===
+with st.sidebar:
+    exp_df = _build_export_df(df_all)  # já vem filtrado pelo segmento atual
+    c1, c2 = st.columns(2)
+    xlsx_bytes = _df_to_xlsx_bytes(exp_df)
+    csv_bytes  = exp_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+    today_str = pd.Timestamp.today().strftime("%Y-%m-%d")
+
+    with c1:
+        st.download_button(
+            "⬇️ Baixar planilha (XLSX)",
+            data=xlsx_bytes,
+            file_name=f"prospeccao_empresas_{today_str}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+    with c2:
+        st.download_button(
+            "⬇️ Baixar CSV",
+            data=csv_bytes,
+            file_name=f"prospeccao_empresas_{today_str}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
