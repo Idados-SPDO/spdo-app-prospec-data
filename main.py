@@ -737,7 +737,7 @@ with st.sidebar:
 
     if st.session_state.auth["is_auth"]:
         st.markdown("---")
-        st.markdown("### 📄 Importar Excel")
+        st.markdown("### 📄 Importar Dados")
 
         # usar key dinâmica para resetar o componente após importação
         uploader_key = f"uploader_xlsx_sidebar_{st.session_state.upload_key}"
@@ -805,6 +805,34 @@ with st.sidebar:
                 except Exception as e:
                     st.error(f"Não foi possível ler o XLSX. Detalhes: {e}")
 
+        st.markdown("### ⬇️ Exportar Dados")
+        df_current = _fetch_df(st.session_state.filter_segmento)  # respeita filtro atual
+        exp_df = _build_export_df(df_current)
+
+        if exp_df.empty:
+            st.caption("Nada para exportar no filtro atual.")
+        else:
+            xlsx_bytes = _df_to_xlsx_bytes(exp_df)
+            csv_bytes  = exp_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+            today_str = pd.Timestamp.today().strftime("%Y-%m-%d")
+
+            c1, c2 = st.columns(2)
+            with c1:
+                st.download_button(
+                    "Planilha (XLSX)",
+                    data=xlsx_bytes,
+                    file_name=f"prospeccao_empresas_{today_str}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+            with c2:
+                st.download_button(
+                    "CSV",
+                    data=csv_bytes,
+                    file_name=f"prospeccao_empresas_{today_str}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
 # Somente login
 if not st.session_state.auth["is_auth"]:
     render_public_home()
@@ -983,26 +1011,3 @@ else:
 df_all = _fetch_df(st.session_state.filter_segmento)
 
 # === Botões de download (XLSX/CSV) ===
-with st.sidebar:
-    exp_df = _build_export_df(df_all)  # já vem filtrado pelo segmento atual
-    c1, c2 = st.columns(2)
-    xlsx_bytes = _df_to_xlsx_bytes(exp_df)
-    csv_bytes  = exp_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-    today_str = pd.Timestamp.today().strftime("%Y-%m-%d")
-
-    with c1:
-        st.download_button(
-            "⬇️ Baixar planilha (XLSX)",
-            data=xlsx_bytes,
-            file_name=f"prospeccao_empresas_{today_str}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
-    with c2:
-        st.download_button(
-            "⬇️ Baixar CSV",
-            data=csv_bytes,
-            file_name=f"prospeccao_empresas_{today_str}.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
