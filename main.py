@@ -5,9 +5,6 @@ from uuid import uuid4
 from datetime import date, datetime
 import unicodedata
 import hashlib
-
-# Snowflake
-from snowflake.snowpark.context import get_active_session
 from snowflake.snowpark import Session
 
 # =========================
@@ -31,12 +28,6 @@ FQN_MAIN     = 'BASES_SPDO.DB_APP_PROSPEC_DATA.TB_EMPRESAS'
 FQN_COMMENTS = 'BASES_SPDO.DB_APP_PROSPEC_DATA.TB_EMPRESAS_COMENTARIOS'
 
 def get_session() -> Session:
-    # 1) Streamlit in Snowflake
-    try:
-        return get_active_session()
-    except Exception:
-        pass
-    # 2) Local / Server com .streamlit/secrets.toml
     return Session.builder.configs(st.secrets["snowflake"]).create()
 
 sf_session = get_session()
