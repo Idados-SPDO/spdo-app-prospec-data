@@ -73,6 +73,21 @@ def _options_from_col(df: pd.DataFrame, col: str) -> list[str]:
         opts.append("Vazio")
     return ["Todos"] + opts
 
+def _unique_token_opts(df: pd.DataFrame, col: str | None) -> list[str]:
+    """
+    Retorna tokens únicos (sem 'Todos'), garantindo 'Vazio' no fim.
+    Usa a mesma lógica de _split_tokens_cell().
+    """
+    if not col or col not in df.columns:
+        return ["Vazio"]
+    toks = set()
+    for v in df[col].tolist():
+        for t in _split_tokens_cell(v):
+            toks.add(t or "Vazio")
+    opts = sorted(toks - {"Vazio"})
+    opts.append("Vazio")
+    return opts
+
 def _truncate(text: str, n: int = 15) -> str:
     s = str(text or "")
     return s if len(s) <= n else s[:n] + "…"
@@ -229,33 +244,51 @@ with tab_nova:
     with st.form("form_nova_empresa"):
         values: dict[str, object] = {}
 
+        opts_sit = _unique_token_opts(df_view, COL_SIT)
+        opts_atu = _unique_token_opts(df_view, COL_ATU)
         # Grade 2 colunas
         cA, cB = st.columns(2)
         for i, col_real in enumerate(all_cols):
             label = _pretty_label(col_real)
             target = cA if (i % 2 == 0) else cB
+            col_norm = norm(col_real)
 
             # Data
-            if norm(col_real) in {norm(x) for x in date_fields}:
+            if col_norm in {norm(x) for x in date_fields}:
                 with target:
                     d = st.date_input(label, value=None, format="DD/MM/YYYY", key=f"new_{col_real}_date")
                 if d:
                     values[col_real] = d.isoformat()
 
             # Booleano
-            elif norm(col_real) in {norm(x) for x in bool_fields}:
+            elif col_norm in {norm(x) for x in bool_fields}:
                 with target:
                     checked = st.checkbox(label, value=False, key=f"new_{col_real}_bool")
                 values[col_real] = _bool_to_simnao(checked)
 
             # Inteiro
-            elif norm(col_real) in {norm(x) for x in int_fields}:
+            elif col_norm in {norm(x) for x in int_fields}:
                 with target:
                     n = st.number_input(label, min_value=0, step=1, format="%d", key=f"new_{col_real}_int")
                 values[col_real] = int(n)
 
+            elif COL_SIT and col_norm == norm(COL_SIT):
+                with target:
+                    sel = st.selectbox(label, options=opts_sit, index=len(opts_sit)-1 if "Vazio" in opts_sit else 0,
+                                    key=f"new_{col_real}_sel")
+                if sel and sel != "Vazio":
+                    values[col_real] = sel
+
+            # 5) **ATUAÇÃO** como dropdown
+            elif COL_ATU and col_norm == norm(COL_ATU):
+                with target:
+                    sel = st.selectbox(label, options=opts_atu, index=len(opts_atu)-1 if "Vazio" in opts_atu else 0,
+                                    key=f"new_{col_real}_sel")
+                if sel and sel != "Vazio":
+                    values[col_real] = sel
+
             # Texto longo
-            elif norm(col_real) in {norm(x) for x in long_text_like}:
+            elif col_norm in {norm(x) for x in long_text_like}:
                 with target:
                     t = st.text_area(label, value="", height=100, key=f"new_{col_real}_ta")
                 if t.strip():
@@ -343,14 +376,17 @@ with tab_export:
 # ========= TAB 1: CATÁLOGO =========
 with tab_catalogo:
     # Filtros
-    c1, c2, c3 = st.columns([1.3, 1.3, 2.4])
+    c1, c2, c3,c4 = st.columns([1.3, 1.3,1.3, 1.3 ])
     with c1:
         seg_opts = _options_from_col(df_view, COL_SEG)
-        seg_sel = st.selectbox("Segmento", options=seg_opts, index=0, key="seg_sel")
+        seg_sel = st.selectbox("Segmento:", options=seg_opts, index=0, key="seg_sel")
     with c2:
         atu_opts = _options_from_col(df_view, COL_ATU)
-        atu_sel = st.selectbox("Atuação", options=atu_opts, index=0, key="atu_sel")
+        atu_sel = st.selectbox("Atuação:", options=atu_opts, index=0, key="atu_sel")
     with c3:
+        sit_opts = _options_from_col(df_view, COL_SIT)
+        sit_sel = st.selectbox("Situação:", options=sit_opts, index=0, key="sit_sel")
+    with c4:
         q = st.text_input("Pesquisar por Nome da Empresa ou CNPJ", placeholder="Ex.: ACME ou 12.345.678/0001-99", key="q_busca")
 
     filtered = df_view
@@ -358,6 +394,8 @@ with tab_catalogo:
         filtered = filtered[filtered[COL_SEG].apply(lambda s: seg_sel in _split_tokens_cell(s))]
     if COL_ATU and atu_sel and atu_sel != "Todos":
         filtered = filtered[filtered[COL_ATU].apply(lambda s: atu_sel in _split_tokens_cell(s))]
+    if COL_SIT and sit_sel and sit_sel != "Todos":
+        filtered = filtered[filtered[COL_SIT].apply(lambda s: sit_sel in _split_tokens_cell(s))]
 
     q_norm = _deacc_lower(q)
     if q_norm:
@@ -465,6 +503,12 @@ def _dialog_detalhes(row_dict: dict):
                         sval = "" if (val is None or (isinstance(val, float) and pd.isna(val))) else str(val)
 
                         target_col = cA if (idx % 2 == 0) else cB
+                        f_norm = norm(f)
+                        col_norm = norm(col_real) if col_real else None
+
+                        def _first_token_or_vazio(v):
+                            toks = _split_tokens_cell(v)
+                            return toks[0] if toks else "Vazio"
 
                         if group_title == "Datas do Contrato":
                             if f in ("DATA_DE_ASSINATURA", "INICIO_DA_RENOVACAO_DA_ASSINATURA", "VIGENCIA"):
@@ -493,13 +537,34 @@ def _dialog_detalhes(row_dict: dict):
                                 if col_real and (new_val.strip() != sval.strip()):
                                     changed_updates[col_real] = new_val.strip() or None
                         else:
-                            with target_col:
-                                if len(sval) > 120 or "\n" in sval:
-                                    new_val = st.text_area(label, value=sval, height=100)
-                                else:
-                                    new_val = st.text_input(label, value=sval)
-                            if col_real and (new_val.strip() != sval.strip()):
-                                changed_updates[col_real] = new_val.strip() or None
+                            if COL_SIT and col_norm == norm(COL_SIT):
+                                opts_sit = _unique_token_opts(df_view, COL_SIT)
+                                current = _first_token_or_vazio(val)
+                                if current and current not in opts_sit:
+                                    opts_sit = [current] + [o for o in opts_sit if o != current]
+                                with target_col:
+                                    new_val = st.selectbox(label, options=opts_sit, index=opts_sit.index(current) if current in opts_sit else 0)
+                                if col_real and (str(new_val).strip() != sval.strip()):
+                                    changed_updates[col_real] = (None if new_val == "Vazio" else str(new_val).strip())
+
+                            elif COL_ATU and col_norm == norm(COL_ATU):
+                                opts_atu = _unique_token_opts(df_view, COL_ATU)
+                                current = _first_token_or_vazio(val)
+                                if current and current not in opts_atu:
+                                    opts_atu = [current] + [o for o in opts_atu if o != current]
+                                with target_col:
+                                    new_val = st.selectbox(label, options=opts_atu, index=opts_atu.index(current) if current in opts_atu else 0)
+                                if col_real and (str(new_val).strip() != sval.strip()):
+                                    changed_updates[col_real] = (None if new_val == "Vazio" else str(new_val).strip())
+
+                            else:
+                                with target_col:
+                                    if len(sval) > 120 or "\n" in sval:
+                                        new_val = st.text_area(label, value=sval, height=100)
+                                    else:
+                                        new_val = st.text_input(label, value=sval)
+                                if col_real and (new_val.strip() != sval.strip()):
+                                    changed_updates[col_real] = new_val.strip() or None
 
             c1, c2 = st.columns([1, 3])
             with c1:
