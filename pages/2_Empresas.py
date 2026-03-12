@@ -417,23 +417,38 @@ with tab_catalogo:
     c1, c2, c3,c4 = st.columns([1.3, 1.3,1.3, 1.3 ])
     with c1:
         seg_opts = _options_from_col(df_view, COL_SEG)
-        seg_sel = st.selectbox("Segmento:", options=seg_opts, index=0, key="seg_sel")
+        seg_sel = st.multiselect("Segmento:", options=seg_opts, default=[], key="seg_sel")
     with c2:
         atu_opts = _options_from_col(df_view, COL_ATU)
-        atu_sel = st.selectbox("Atuação:", options=atu_opts, index=0, key="atu_sel")
+        atu_sel = st.multiselect("Atuação:", options=atu_opts, default=[], key="atu_sel")
     with c3:
         sit_opts = _options_from_col(df_view, COL_SIT)
-        sit_sel = st.selectbox("Situação:", options=sit_opts, index=0, key="sit_sel")
+        sit_sel = st.multiselect("Situação:", options=sit_opts, default=[], key="sit_sel")
     with c4:
         q = st.text_input("Pesquisar por Nome da Empresa ou CNPJ", placeholder="Ex.: ACME ou 12.345.678/0001-99", key="q_busca")
 
     filtered = df_view
-    if COL_SEG and seg_sel and seg_sel != "Todos":
-        filtered = filtered[filtered[COL_SEG].apply(lambda s: seg_sel in _split_tokens_cell(s))]
-    if COL_ATU and atu_sel and atu_sel != "Todos":
-        filtered = filtered[filtered[COL_ATU].apply(lambda s: atu_sel in _split_tokens_cell(s))]
-    if COL_SIT and sit_sel and sit_sel != "Todos":
-        filtered = filtered[filtered[COL_SIT].apply(lambda s: sit_sel in _split_tokens_cell(s))]
+        
+    if COL_SEG and seg_sel:
+        filtered = filtered[
+            filtered[COL_SEG].apply(
+                lambda s: any(opt in _split_tokens_cell(s) for opt in seg_sel)
+            )
+        ]
+
+    if COL_ATU and atu_sel:
+        filtered = filtered[
+            filtered[COL_ATU].apply(
+                lambda s: any(opt in _split_tokens_cell(s) for opt in atu_sel)
+            )
+        ]
+
+    if COL_SIT and sit_sel:
+        filtered = filtered[
+            filtered[COL_SIT].apply(
+                lambda s: any(opt in _split_tokens_cell(s) for opt in sit_sel)
+            )
+        ]
 
     q_norm = _deacc_lower(q)
     if q_norm:
