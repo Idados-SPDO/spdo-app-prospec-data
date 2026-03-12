@@ -1,4 +1,3 @@
-# pages/2_Empresas.py
 import streamlit as st
 import pandas as pd
 import unicodedata
@@ -7,7 +6,7 @@ import io
 
 from src.auth import is_authenticated, current_user
 from src.utils_sf import (
-    fetch_companies, FQN_MAIN, clear_companies_cache,
+    fetch_companies, FQN_MAIN, FQN_NEW, clear_companies_cache,
     update_company_row,
     STAGE_APRES,
     stage_prefix_for_company,
@@ -20,6 +19,9 @@ from src.utils_sf import (
     delete_company_row,
     create_company_row,
     fetch_comments_all,
+    _read_uploaded_csv,
+    _upload_csv_to_snowflake
+    
 )
 from zoneinfo import ZoneInfo
 from datetime import datetime
@@ -34,6 +36,7 @@ if not is_authenticated():
 st.title("🏢 Empresas")
 
 # ========= Helpers =========
+
 def _deacc_lower(s: str) -> str:
     if s is None:
         return ""
@@ -41,6 +44,9 @@ def _deacc_lower(s: str) -> str:
     s = unicodedata.normalize("NFD", s)
     s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
     return s.lower().strip()
+
+def norm(x: str) -> str:
+    return _deacc_lower(x).replace(" ", "").replace("_", "")
 
 def _only_digits(s: str) -> str:
     return re.sub(r"\D+", "", str(s or ""))
@@ -93,7 +99,6 @@ def _truncate(text: str, n: int = 15) -> str:
     return s if len(s) <= n else s[:n] + "…"
 
 def _find_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
-    norm = lambda x: _deacc_lower(x).replace(" ", "").replace("_", "")
     norm_map = {norm(c): c for c in df.columns}
     for cand in candidates:
         key = norm(cand)
@@ -195,7 +200,7 @@ def _badges_inline(groups: list[tuple[list[str], callable, int]]) -> None:  # ty
 
 # ========= Carrega base =========
 try:
-    df = fetch_companies()
+    df = fetch_companies(FQN_NEW)
 except Exception as e:
     st.error(f"Falha ao carregar dados das empresas: {e}")
     st.stop()
@@ -215,7 +220,9 @@ if not COL_KEY:
     st.error("Não encontrei uma coluna-chave (ID/CNPJ/NOME) para atualizar os registros.")
     st.stop()
 
+    
 # ========= TABS =========
+#tab_catalogo, tab_nova, tab_export, tab_importar = st.tabs(["📚 Catálogo", "➕ Nova Empresa", "📥 Exportar", "Importar"])
 tab_catalogo, tab_nova, tab_export = st.tabs(["📚 Catálogo", "➕ Nova Empresa", "📥 Exportar"])
 
 # ========= TAB 2: NOVA EMPRESA =========
@@ -224,21 +231,52 @@ with tab_nova:
     st.caption("Todos os campos da tabela estão disponíveis abaixo. Preencha o que for necessário.")
 
     # Lista de todas as colunas da base (já sem UPDATED_AT)
-    all_cols = list(df_view.columns)
+    all_cols = [c for c in df_view.columns if norm(c) != "apresentacao"]
 
-    # Heurísticas de tipo por nome
-    date_fields = {"DATA_DE_ASSINATURA", "INICIO_DA_RENOVACAO_DA_ASSINATURA", "VIGENCIA"}
+    date_fields = {"DATA_DA_ASSINATURA", "INICIO_RENOVACAO_ASSINATURA", "VIGENCIA"}
     bool_fields = {"NDA_ASSINADO"}
-    int_fields  = {"VALIDADE_EM_ANOS", "VALIDADE_EM_MESES", "VALIDADE_EM_DIAS"}
-    long_text_like = {"DESCRICAO", "RESUMO", "DOCUMENTO", "OBS", "PONTOS_FORTES", "PONTOS_FRACOS"}
-
+    int_fields  = {"VALIDADE_ANOS", "VALIDADE_MESES", "VALIDADE_DIAS"}
+    long_text_like = {
+        "CAUSA_RAIZ",
+        "DEMANDA",
+        "CRONOLOGIA_DA_PARCERIA",
+        "DESCRICAO_EMPRESA",
+        "RESUMO_EMPRESA",
+        "METODOLOGIA",
+        "COBERTURA",
+        "DOCUMENTO",
+        "OBS",
+        "PONTOS_FORTES",
+        "PONTOS_FRACOS",
+        "CONCORRENTES",
+    }
     # Mapa normalizado -> real
     norm = lambda x: _deacc_lower(x).replace(" ", "").replace("_", "")
     norm_map = {norm(c): c for c in all_cols}
 
     def _pretty_label(raw: str) -> str:
-        up_map = {"CNPJ": "CNPJ", "NDA_ASSINADO": "NDA Assinado"}
-        if raw in up_map: return up_map[raw]
+        label_map = {
+            "CNPJ": "CNPJ",
+            "NDA_ASSINADO": "NDA Assinado",
+            "NOME_DA_EMPRESA": "Nome da Empresa",
+            "CAUSA_RAIZ": "Causa Raiz",
+            "POTENCIAL_DE_PARCERIA": "Potencial de Parceria",
+            "STATUS_ATUAL": "Status Atual",
+            "CRONOLOGIA_DA_PARCERIA": "Cronologia da Parceria",
+            "DESCRICAO_EMPRESA": "Descrição da Empresa",
+            "RESUMO_EMPRESA": "Resumo da Empresa",
+            "DATA_DA_ASSINATURA": "Data da Assinatura",
+            "VALIDADE_ANOS": "Validade (Anos)",
+            "VALIDADE_MESES": "Validade (Meses)",
+            "VALIDADE_DIAS": "Validade (Dias)",
+            "INICIO_RENOVACAO_ASSINATURA": "Início Renovação Assinatura",
+            "ANALISE_TECNICA": "Análise Técnica",
+            "CONTATOS": "Contatos",
+            "ATUACAO": "Atuação",
+            "SITUACAO": "Situação",
+        }
+        if raw in label_map:
+            return label_map[raw]
         return raw.replace("_", " ").title()
 
     with st.form("form_nova_empresa"):
@@ -314,7 +352,7 @@ with tab_nova:
             if not values:
                 st.warning("Preencha pelo menos um campo.")
             else:
-                create_company_row(FQN_MAIN, values)
+                create_company_row(FQN_NEW, values)
                 clear_companies_cache()
                 st.success("Empresa criada com sucesso.")
                 st.rerun()
@@ -449,27 +487,89 @@ with tab_catalogo:
                         on_click=lambda r=row: _dialog_detalhes(r.to_dict()),
                     )
 
+# ========== TAB 4: Importação ===========
+#with tab_importar:
+#    st.subheader("Importar CSV")
+#    st.caption("Envie um arquivo CSV, visualize os dados e crie/substitua a tabela BASES_SPDO.DB_APP_PROSPEC_DATA.TB_EMPRESAS_UPDATE no Snowflake.")
+#
+#    uploaded_csv = st.file_uploader(
+#        "Selecione um arquivo CSV",
+#        type=["csv"],
+#        key="upload_csv_empresas"
+#    )
+#
+#    if uploaded_csv is not None:
+#        try:
+#            df_csv = _read_uploaded_csv(uploaded_csv)
+#
+#            st.success("CSV carregado com sucesso.")
+#            st.caption(f"{len(df_csv)} linhas • {len(df_csv.columns)} colunas")
+#
+#            st.dataframe(df_csv, use_container_width=True, height=400)
+#
+#            if st.button(
+#                "Criar tabela no Snowflake",
+#                type="primary",
+#                use_container_width=True,
+#                key="btn_create_table_sf"
+#            ):
+#                try:
+#                    _upload_csv_to_snowflake(df_csv, FQN_NEW)
+#                    st.success("Tabela BASES_SPDO.DB_APP_PROSPEC_DATA.TB_EMPRESAS_UPDATE criada/atualizada com sucesso.")
+#                except Exception as e:
+#                    st.error(f"Falha ao criar tabela no Snowflake: {e}")
+#
+#        except Exception as e:
+#            st.error(f"Falha ao ler o CSV: {e}")
+            
 # ========= Modal de DETALHES =========
 @st.dialog("Detalhes da empresa", width="large")
 def _dialog_detalhes(row_dict: dict):
     GROUPS = {
         "Dados Gerais": [
-            "NOME_DA_EMPRESA", "CLASSIFICAÇÃO", "SITUAÇÃO", "CNPJ",
-            "SEGMENTO", "ATUAÇÃO", "SITE", "CONTATO", "STATUS_ATUAL",
+            "SOLICITANTE",
+            "CONTRATO",
+            "NOME_DA_EMPRESA",
+            "CAUSA_RAIZ",
+            "DEMANDA",
+            "SITUACAO",
+            "CNPJ",
+            "SEGMENTO",
+            "ATUACAO",
+            "POTENCIAL_DE_PARCERIA",
+            "STATUS_ATUAL",
+            "SITE",
+            "CONTATOS",
         ],
         "Responsáveis": [
-            "APROVACAO", "ANALISE_TECNICA", "RELACIONAMENTO", "AUTOMACAO",
+            "APROVACAO",
+            "ANALISE_TECNICA",
+            "RELACIONAMENTO",
+            "AUTOMACAO",
         ],
         "Descrição da Empresa": [
-            "DESCRICAO", "RESUMO", "DOCUMENTO",
+            "CRONOLOGIA_DA_PARCERIA",
+            "DESCRICAO_EMPRESA",
+            "RESUMO_EMPRESA",
+            "METODOLOGIA",
+            "COBERTURA",
+            "DOCUMENTO",
         ],
         "Datas do Contrato": [
-            "DATA_DE_ASSINATURA", "VALIDADE_EM_ANOS", "VALIDADE_EM_MESES",
-            "VALIDADE_EM_DIAS", "INICIO_DA_RENOVACAO_DA_ASSINATURA",
-            "VIGENCIA", "NDA_ASSINADO",
+            "DATA_DA_ASSINATURA",
+            "VALIDADE_ANOS",
+            "VALIDADE_MESES",
+            "VALIDADE_DIAS",
+            "INICIO_RENOVACAO_ASSINATURA",
+            "VIGENCIA",
+            "NDA_ASSINADO",
         ],
         "Dados de Mercado": [
-            "OBS", "PONTOS_FORTES", "PONTOS_FRACOS", "CONCORRENTES", "PORTE",
+            "OBS",
+            "PONTOS_FORTES",
+            "PONTOS_FRACOS",
+            "CONCORRENTES",
+            "PORTE",
         ],
     }
 
@@ -511,7 +611,7 @@ def _dialog_detalhes(row_dict: dict):
                             return toks[0] if toks else "Vazio"
 
                         if group_title == "Datas do Contrato":
-                            if f in ("DATA_DE_ASSINATURA", "INICIO_DA_RENOVACAO_DA_ASSINATURA", "VIGENCIA"):
+                            if f in ("DATA_DA_ASSINATURA", "INICIO_RENOVACAO_ASSINATURA", "VIGENCIA"):
                                 d_default = _to_date_safe(val)
                                 with target_col:
                                     new_d = st.date_input(
@@ -581,7 +681,7 @@ def _dialog_detalhes(row_dict: dict):
                         if key_val is None or (isinstance(key_val, float) and pd.isna(key_val)):
                             st.error("Não foi possível determinar a chave (ID/CNPJ/NOME) para atualizar.")
                         else:
-                            update_company_row(FQN_MAIN, COL_KEY, key_val, changed_updates)
+                            update_company_row(FQN_NEW, COL_KEY, key_val, changed_updates)
                             clear_companies_cache()
                             st.success("Alterações salvas com sucesso.")
                             st.rerun()

@@ -9,10 +9,16 @@ from io import BytesIO
 from uuid import uuid4
 from datetime import datetime
 from zoneinfo import ZoneInfo
-
+import io
 
 FQN_MAIN = "BASES_SPDO.DB_APP_PROSPEC_DATA.TB_EMPRESAS"
+FQN_NEW = "BASES_SPDO.DB_APP_PROSPEC_DATA.TB_EMPRESAS_UPDATE"
 FQN_COMMENTS = "BASES_SPDO.DB_APP_PROSPEC_DATA.TB_EMPRESAS_COMENTARIOS"
+
+
+def _split_fqn(fqn: str) -> tuple[str, str, str]:
+    db, schema, table = fqn.split(".")
+    return db, schema, table
 
 
 def get_session() -> Session:
@@ -138,9 +144,9 @@ def append_excel_into_table(fqn: str, df_raw: pd.DataFrame) -> int:
     return len(df2)
 
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_companies(limit: int | None = None) -> pd.DataFrame:
+def fetch_companies(fqn: str = FQN_NEW, limit: int | None = None) -> pd.DataFrame:
     """Cache sem ORDER BY UPDATED_AT."""
-    sql = f"SELECT * FROM {FQN_MAIN}"
+    sql = f"SELECT * FROM {fqn}"
     if limit and int(limit) > 0:
         sql += f" LIMIT {int(limit)}"
     return _sf(sql).to_pandas()
@@ -366,3 +372,81 @@ def fetch_comments_all() -> pd.DataFrame:
     """Retorna todos os comentários."""
     session = get_session()
     return session.table(FQN_COMMENTS).to_pandas()
+
+def _read_uploaded_csv(uploaded_file) -> pd.DataFrame:
+    raw = uploaded_file.getvalue()
+
+    attempts = [
+        {"encoding": "utf-8-sig", "sep": None},
+        {"encoding": "utf-8", "sep": None},
+        {"encoding": "latin1", "sep": None},
+        {"encoding": "utf-8-sig", "sep": ";"},
+        {"encoding": "utf-8-sig", "sep": ","},
+        {"encoding": "latin1", "sep": ";"},
+        {"encoding": "latin1", "sep": ","},
+    ]
+
+    last_error = None
+    for cfg in attempts:
+        try:
+            df = pd.read_csv(
+                io.BytesIO(raw),
+                encoding=cfg["encoding"],
+                sep=cfg["sep"],
+                engine="python" if cfg["sep"] is None else None,
+            )
+            if df is not None and len(df.columns) > 0:
+                return df
+        except Exception as e:
+            last_error = e
+
+    raise ValueError(f"Não foi possível ler o CSV enviado. Erro: {last_error}")
+
+
+def _normalize_sf_columns(cols: list[str]) -> list[str]:
+    seen = {}
+    final_cols = []
+
+    for col in cols:
+        c = unicodedata.normalize("NFD", str(col))
+        c = "".join(ch for ch in c if unicodedata.category(ch) != "Mn")
+        c = c.upper().strip()
+        c = re.sub(r"[^A-Z0-9]+", "_", c)
+        c = re.sub(r"_+", "_", c).strip("_")
+
+        if not c:
+            c = "COLUNA"
+
+        if re.match(r"^\d", c):
+            c = f"COL_{c}"
+
+        if c in seen:
+            seen[c] += 1
+            c = f"{c}_{seen[c]}"
+        else:
+            seen[c] = 0
+
+        final_cols.append(c)
+
+    return final_cols
+
+
+def _upload_csv_to_snowflake(df_csv: pd.DataFrame, fqn: str = FQN_NEW):
+    df_up = df_csv.copy()
+    df_up.columns = _normalize_sf_columns(list(df_up.columns))
+    df_up = df_up.where(pd.notnull(df_up), None)
+
+    session = get_session()
+    db, schema, table = _split_fqn(fqn)
+
+    session.write_pandas(
+        df_up,
+        table_name=table,
+        database=db,
+        schema=schema,
+        auto_create_table=True,
+        overwrite=True,
+        quote_identifiers=False,
+    )
+
+    fetch_companies.clear()
