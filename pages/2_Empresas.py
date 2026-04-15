@@ -4,6 +4,8 @@ import unicodedata
 import re
 import io
 
+from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
+
 from src.auth import is_authenticated, current_user
 from src.utils_sf import (
     fetch_companies, FQN_MAIN, FQN_NEW, clear_companies_cache,
@@ -209,18 +211,291 @@ except Exception as e:
 df_view = df.drop(columns=["UPDATED_AT"], errors="ignore").copy()
 
 # Colunas chave e auxiliares
-COL_NOME = _find_col(df_view, ["nome da empresa", "nome_empresa", "nome"])
-COL_SIT  = _find_col(df_view, ["situação", "situacao", "status"])
-COL_ATU  = _find_col(df_view, ["atuação", "atuacao"])
-COL_SEG  = _find_col(df_view, ["segmento"])
-COL_CNPJ = _find_col(df_view, ["cnpj"])
-COL_ID   = _find_col(df_view, ["id"])
+COL_NOME  = _find_col(df_view, ["nome da empresa", "nome_empresa", "nome"])
+COL_SIT   = _find_col(df_view, ["situação", "situacao", "status"])
+COL_ATU   = _find_col(df_view, ["atuação", "atuacao"])
+COL_SEG   = _find_col(df_view, ["segmento"])
+COL_CNPJ  = _find_col(df_view, ["cnpj"])
+COL_ID    = _find_col(df_view, ["id"])
+COL_CAUSA = _find_col(df_view, ["CAUSA_RAIZ", "causa_raiz", "causa raiz"])
 COL_KEY  = COL_ID or COL_CNPJ or COL_NOME
 if not COL_KEY:
     st.error("Não encontrei uma coluna-chave (ID/CNPJ/NOME) para atualizar os registros.")
     st.stop()
 
-    
+
+# ========= Modal de DETALHES =========
+@st.dialog("Detalhes da empresa", width="large")
+def _dialog_detalhes(row_dict: dict):
+    GROUPS = {
+        "Dados Gerais": [
+            "SOLICITANTE",
+            "CONTRATO",
+            "NOME_DA_EMPRESA",
+            "CAUSA_RAIZ",
+            "DEMANDA",
+            "SITUACAO",
+            "CNPJ",
+            "SEGMENTO",
+            "ATUACAO",
+            "POTENCIAL_DE_PARCERIA",
+            "STATUS_ATUAL",
+            "SITE",
+            "CONTATOS",
+        ],
+        "Responsáveis": [
+            "APROVACAO",
+            "ANALISE_TECNICA",
+            "RELACIONAMENTO",
+            "AUTOMACAO",
+        ],
+        "Descrição da Empresa": [
+            "CRONOLOGIA_DA_PARCERIA",
+            "DESCRICAO_EMPRESA",
+            "RESUMO_EMPRESA",
+            "METODOLOGIA",
+            "COBERTURA",
+            "DOCUMENTO",
+        ],
+        "Datas do Contrato": [
+            "DATA_DA_ASSINATURA",
+            "VALIDADE_ANOS",
+            "VALIDADE_MESES",
+            "VALIDADE_DIAS",
+            "INICIO_RENOVACAO_ASSINATURA",
+            "VIGENCIA",
+            "NDA_ASSINADO",
+        ],
+        "Dados de Mercado": [
+            "OBS",
+            "PONTOS_FORTES",
+            "PONTOS_FRACOS",
+            "CONCORRENTES",
+            "PORTE",
+        ],
+    }
+
+    def _resolve_col_once(field_key: str) -> str | None:
+        return _find_col(df_view, [field_key, field_key.replace("_", " ")])
+
+    nome_full = row_dict.get(COL_NOME) if COL_NOME else row_dict.get("NOME") or "Empresa"
+    st.subheader(str(nome_full))
+
+    company_prefix = stage_prefix_for_company(row_dict, COL_CNPJ, COL_NOME)
+    main_tabs = st.tabs(["🗂️ Dados", "📎 Apresentações", "💬 Comentários"])
+
+    with main_tabs[0]:
+        data_tabs = st.tabs(list(GROUPS.keys()))
+        changed_updates: dict[str, str | None] = {}
+
+        with st.form("form_edit_empresa"):
+            for (tab, (group_title, fields)) in zip(data_tabs, GROUPS.items()):
+                with tab:
+                    if group_title == "Descrição da Empresa":
+                        single = st.container()
+                        cA, cB = single, single
+                    else:
+                        cA, cB = st.columns(2)
+
+                    for idx, f in enumerate(fields):
+                        col_real = _resolve_col_once(f)
+                        label = f.replace("_", " ").title() if f not in {"CNPJ", "NDA_ASSINADO"} else ("CNPJ" if f=="CNPJ" else "NDA Assinado")
+                        val = row_dict.get(col_real) if col_real else None
+                        sval = "" if (val is None or (isinstance(val, float) and pd.isna(val))) else str(val)
+
+                        target_col = cA if (idx % 2 == 0) else cB
+                        f_norm = norm(f)
+                        col_norm = norm(col_real) if col_real else None
+
+                        def _first_token_or_vazio(v):
+                            toks = _split_tokens_cell(v)
+                            return toks[0] if toks else "Vazio"
+
+                        if group_title == "Datas do Contrato":
+                            if f in ("DATA_DA_ASSINATURA", "INICIO_RENOVACAO_ASSINATURA", "VIGENCIA"):
+                                d_default = _to_date_safe(val)
+                                with target_col:
+                                    new_d = st.date_input(
+                                        label,
+                                        value=d_default if d_default else _dt.date.today(),
+                                        format="DD/MM/YYYY"
+                                    )
+                                new_s = new_d.isoformat() if new_d else None
+                                if col_real and (new_s != (d_default.isoformat() if d_default else "")):
+                                    changed_updates[col_real] = new_s
+                            elif f == "NDA_ASSINADO":
+                                with target_col:
+                                    checked = st.checkbox(label, value=_to_bool_safe(val))
+                                new_s = _bool_to_simnao(checked)
+                                if col_real and (new_s.strip() != sval.strip()):
+                                    changed_updates[col_real] = new_s
+                            else:
+                                with target_col:
+                                    if len(sval) > 120 or "\n" in sval:
+                                        new_val = st.text_area(label, value=sval, height=100)
+                                    else:
+                                        new_val = st.text_input(label, value=sval)
+                                if col_real and (new_val.strip() != sval.strip()):
+                                    changed_updates[col_real] = new_val.strip() or None
+                        else:
+                            if COL_SIT and col_norm == norm(COL_SIT):
+                                opts_sit = _unique_token_opts(df_view, COL_SIT)
+                                current = _first_token_or_vazio(val)
+                                if current and current not in opts_sit:
+                                    opts_sit = [current] + [o for o in opts_sit if o != current]
+                                with target_col:
+                                    new_val = st.selectbox(label, options=opts_sit, index=opts_sit.index(current) if current in opts_sit else 0)
+                                if col_real and (str(new_val).strip() != sval.strip()):
+                                    changed_updates[col_real] = (None if new_val == "Vazio" else str(new_val).strip())
+
+                            elif COL_ATU and col_norm == norm(COL_ATU):
+                                opts_atu = _unique_token_opts(df_view, COL_ATU)
+                                current = _first_token_or_vazio(val)
+                                if current and current not in opts_atu:
+                                    opts_atu = [current] + [o for o in opts_atu if o != current]
+                                with target_col:
+                                    new_val = st.selectbox(label, options=opts_atu, index=opts_atu.index(current) if current in opts_atu else 0)
+                                if col_real and (str(new_val).strip() != sval.strip()):
+                                    changed_updates[col_real] = (None if new_val == "Vazio" else str(new_val).strip())
+
+                            else:
+                                with target_col:
+                                    if len(sval) > 120 or "\n" in sval:
+                                        new_val = st.text_area(label, value=sval, height=100)
+                                    else:
+                                        new_val = st.text_input(label, value=sval)
+                                if col_real and (new_val.strip() != sval.strip()):
+                                    changed_updates[col_real] = new_val.strip() or None
+
+            c1, c2 = st.columns([1, 3])
+            with c1:
+                submitted = st.form_submit_button("💾 Salvar alterações", use_container_width=True, type="primary")
+            with c2:
+                st.caption("Somente campos modificados são atualizados no banco.")
+
+            if submitted:
+                if not changed_updates:
+                    st.info("Nenhuma alteração detectada.")
+                else:
+                    try:
+                        # Tenta ID → CNPJ → NOME até achar um valor não-nulo
+                        _eff_col, _eff_val = None, None
+                        for _c in [COL_ID, COL_CNPJ, COL_NOME]:
+                            if _c:
+                                _v = row_dict.get(_c)
+                                if _v is not None and not (isinstance(_v, float) and pd.isna(_v)) and str(_v).strip():
+                                    _eff_col, _eff_val = _c, _v
+                                    break
+                        key_val = _eff_val
+                        if _eff_col is None or key_val is None:
+                            st.error("Não foi possível determinar a chave (ID/CNPJ/NOME) para atualizar.")
+                        else:
+                            update_company_row(FQN_NEW, _eff_col, key_val, changed_updates)
+                            clear_companies_cache()
+                            st.success("Alterações salvas com sucesso.")
+                            st.rerun()
+                    except Exception as e:
+                        st.error(f"Falha ao salvar alterações: {e}")
+
+    with main_tabs[1]:
+        up_files = st.file_uploader("Enviar arquivos", type=None, accept_multiple_files=True)
+        if up_files:
+            for uf in up_files:
+                try:
+                    upload_presentation(company_prefix, uf, uf.name)
+                    st.success(f"Enviado: {uf.name}")
+                except Exception as e:
+                    st.error(f"Falha ao enviar {uf.name}: {e}")
+
+        st.divider()
+        try:
+            files_df = list_presentations(company_prefix)
+        except Exception as e:
+            st.error(f"Falha ao listar arquivos: {e}")
+            files_df = pd.DataFrame()
+
+        if files_df.empty:
+            st.info("Nenhum arquivo disponível.")
+        else:
+            files_df.columns = [c.lower() for c in files_df.columns]
+            for _, fr in files_df.iterrows():
+                full_name = str(fr.get('"name"', ""))
+                base = full_name.split("/")[-1] if "/" in full_name else full_name
+                try:
+                    url = get_presigned_url(company_prefix, base, expires_seconds=3600)
+                    if url:
+                        st.link_button(f"🔗 {base}", url, use_container_width=True)
+                    else:
+                        data = download_presentation(company_prefix, base)
+                        st.download_button(
+                            f"⬇️ {base}",
+                            data=data,
+                            file_name=base,
+                            mime="application/octet-stream",
+                            use_container_width=True,
+                        )
+                except Exception as e:
+                    st.error(f"Falha ao baixar {base}: {e}")
+
+    with main_tabs[2]:
+        user = None
+        try:
+            user = current_user()
+        except Exception:
+            pass
+
+        key_val = row_dict.get(COL_KEY)
+
+        st.markdown("**Registrar novo comentário**")
+        with st.form("form_comentario"):
+            msg = st.text_area("Escreva seu comentário", placeholder="Digite aqui...", height=120)
+            submitted_c = st.form_submit_button("💬 Publicar", type="primary", use_container_width=True)
+
+        if submitted_c:
+            if not msg.strip():
+                st.warning("Comentário vazio.")
+            elif key_val is None or (isinstance(key_val, float) and pd.isna(key_val)):
+                st.error("Não foi possível associar o comentário à empresa (chave ausente).")
+            else:
+                try:
+                    username = (user or {}).get("username") or (user or {}).get("user") or "desconhecido"
+                    display_name = (user or {}).get("name") or username
+                    created_at = datetime.now(ZoneInfo("America/Sao_Paulo"))
+                    save_company_comment(
+                        empresa_id=str(key_val),
+                        username=str(username),
+                        name=str(display_name),
+                        message=str(msg),
+                        created_at=created_at,
+                    )
+                    st.success("Comentário publicado.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Falha ao salvar comentário: {e}")
+
+        st.divider()
+        st.markdown("**Comentários**")
+        try:
+            dfc = fetch_company_comments(str(key_val))
+        except Exception as e:
+            st.error(f"Falha ao carregar comentários: {e}")
+            dfc = pd.DataFrame()
+
+        if dfc.empty:
+            st.info("Ainda não há comentários.")
+        else:
+            for _, r in dfc.iterrows():
+                nm = str(r.get("NAME") or r.get("USERNAME") or "Usuário")
+                msg = str(r.get("MESSAGE") or "")
+                ts = r.get("CREATED_AT")
+                try:
+                    ts_fmt = pd.to_datetime(ts).strftime("%d/%m/%Y %H:%M")
+                except Exception:
+                    ts_fmt = "-"
+                st.markdown(f"**{nm}** · {ts_fmt}")
+                st.markdown(msg)
+                st.markdown("---")
+
 # ========= TABS =========
 #tab_catalogo, tab_nova, tab_export, tab_importar = st.tabs(["📚 Catálogo", "➕ Nova Empresa", "📥 Exportar", "Importar"])
 tab_catalogo, tab_nova, tab_export = st.tabs(["📚 Catálogo", "➕ Nova Empresa", "📥 Exportar"])
@@ -412,7 +687,8 @@ with tab_export:
             st.error(f"Falha ao gerar planilha: {e}")
 
 # ========= TAB 1: CATÁLOGO =========
-with tab_catalogo:
+@st.fragment
+def _render_catalogo():
     # Filtros
     c1, c2, c3,c4 = st.columns([1.3, 1.3,1.3, 1.3 ])
     with c1:
@@ -469,38 +745,69 @@ with tab_catalogo:
         if COL_NOME:
             filtered = filtered.sort_values(by=COL_NOME, kind="stable")
 
-        CARD_MIN_HEIGHT = 230
-        N_COLS = 3
-        cols = st.columns(N_COLS)
+        # ---- Monta DataFrame para AgGrid ----
+        display_cols = {}
+        if COL_NOME:  display_cols["Nome da Empresa"] = filtered[COL_NOME].fillna("").astype(str)
+        if COL_ATU:   display_cols["Atuação"]         = filtered[COL_ATU].fillna("").astype(str)
+        if COL_CAUSA: display_cols["Causa Raiz"]      = filtered[COL_CAUSA].fillna("").astype(str)
+        if COL_SIT:   display_cols["Situação"]        = filtered[COL_SIT].fillna("").astype(str)
+        #display_cols["🔎"] = ""
 
-        for i, (_, row) in enumerate(filtered.iterrows()):
-            with cols[i % N_COLS]:
-                with st.container(border=True):
-                    nome_full = row.get(COL_NOME) if COL_NOME else "(sem nome)"
-                    nome_card = _truncate(nome_full, 15)
-                    c_head1, c_head2 = st.columns([4, 1])
-                    with c_head1:
-                        st.markdown(f"### {nome_card}")
+        df_grid = pd.DataFrame(display_cols, index=filtered.index)
 
-                    seg_tokens = _split_tokens_cell(row.get(COL_SEG)) if COL_SEG else []
-                    atu_tokens = _split_tokens_cell(row.get(COL_ATU)) if COL_ATU else []
-                    sit_token  = [str(row.get(COL_SIT) or "Vazio")] if COL_SIT else []
+        gb = GridOptionsBuilder.from_dataframe(df_grid)
+        gb.configure_default_column(resizable=True, sortable=True, filter=True, wrapText=True, autoHeight=True)
+        gb.configure_column("Nome da Empresa", minWidth=200)
+        gb.configure_column("Atuação",         minWidth=130, maxWidth=200)
+        gb.configure_column("Causa Raiz",      minWidth=250, flex=2)
+        gb.configure_column("Situação",        minWidth=130, maxWidth=180)
+        gb.configure_column("Detalhes", minWidth=100, maxWidth=120, sortable=False, filter=False,
+                            cellRenderer=JsCode("""
+                                class BtnRenderer {
+                                    init(params) {
+                                        this.eGui = document.createElement('button');
+                                        this.eGui.innerHTML = '\uD83D\uDD0E';
+                                        this.eGui.style.cssText = 'background:none;border:1px solid #ccc;border-radius:4px;cursor:pointer;font-size:12px;padding:2px 8px;';
+                                        this.eGui.addEventListener('click', function() {
+                                            params.node.setSelected(true, true);
+                                        });
+                                    }
+                                    getGui() { return this.eGui; }
+                                }
+                            """))
+        gb.configure_selection("single", use_checkbox=False)
+        gb.configure_grid_options(rowHeight=40, domLayout="normal", suppressRowClickSelection=True)
+        grid_opts = gb.build()
 
-                    _badges_inline([
-                        (seg_tokens, _segmento_color, 1),
-                        (atu_tokens, _atuacao_color, 1),
-                        (sit_token, _situacao_color, 1),
-                    ])
+        if "_aggrid_key" not in st.session_state:
+            st.session_state["_aggrid_key"] = 0
 
-                    st.markdown(f"<div style='min-height:{CARD_MIN_HEIGHT - 140}px'></div>", unsafe_allow_html=True)
+        grid_resp = AgGrid(
+            df_grid,
+            gridOptions=grid_opts,
+            update_mode=GridUpdateMode.SELECTION_CHANGED,
+            allow_unsafe_jscode=True,
+            use_container_width=True,
+            height=min(50 + len(df_grid) * 42, 600),
+            theme="streamlit",
+            key=f"aggrid_empresas_{st.session_state['_aggrid_key']}",
+            custom_css={
+                ".ag-row-selected": {"background-color": "transparent !important"},
+                ".ag-row-selected:hover": {"background-color": "rgba(0,0,0,0.04) !important"},
+            },
+        )
 
-                    st.button(
-                        "🔎 Detalhes",
-                        key=f"btn_det_{i}",
-                        type="secondary",
-                        use_container_width=True,
-                        on_click=lambda r=row: _dialog_detalhes(r.to_dict()),
-                    )
+        selected = grid_resp.get("selected_rows")
+        if selected is not None and len(selected) > 0:
+            sel_row = selected.iloc[0] if isinstance(selected, pd.DataFrame) else selected[0]
+            sel_nome = sel_row.get("Nome da Empresa", "") if hasattr(sel_row, "get") else sel_row["Nome da Empresa"]
+            match = filtered[filtered[COL_NOME].astype(str) == sel_nome] if COL_NOME else pd.DataFrame()
+            if not match.empty:
+                st.session_state["_aggrid_key"] = st.session_state.get("_aggrid_key", 0) + 1
+                _dialog_detalhes(match.iloc[0].to_dict())
+
+with tab_catalogo:
+    _render_catalogo()
 
 # ========== TAB 4: Importação ===========
 #with tab_importar:
@@ -536,270 +843,4 @@ with tab_catalogo:
 #
 #        except Exception as e:
 #            st.error(f"Falha ao ler o CSV: {e}")
-            
-# ========= Modal de DETALHES =========
-@st.dialog("Detalhes da empresa", width="large")
-def _dialog_detalhes(row_dict: dict):
-    GROUPS = {
-        "Dados Gerais": [
-            "SOLICITANTE",
-            "CONTRATO",
-            "NOME_DA_EMPRESA",
-            "CAUSA_RAIZ",
-            "DEMANDA",
-            "SITUACAO",
-            "CNPJ",
-            "SEGMENTO",
-            "ATUACAO",
-            "POTENCIAL_DE_PARCERIA",
-            "STATUS_ATUAL",
-            "SITE",
-            "CONTATOS",
-        ],
-        "Responsáveis": [
-            "APROVACAO",
-            "ANALISE_TECNICA",
-            "RELACIONAMENTO",
-            "AUTOMACAO",
-        ],
-        "Descrição da Empresa": [
-            "CRONOLOGIA_DA_PARCERIA",
-            "DESCRICAO_EMPRESA",
-            "RESUMO_EMPRESA",
-            "METODOLOGIA",
-            "COBERTURA",
-            "DOCUMENTO",
-        ],
-        "Datas do Contrato": [
-            "DATA_DA_ASSINATURA",
-            "VALIDADE_ANOS",
-            "VALIDADE_MESES",
-            "VALIDADE_DIAS",
-            "INICIO_RENOVACAO_ASSINATURA",
-            "VIGENCIA",
-            "NDA_ASSINADO",
-        ],
-        "Dados de Mercado": [
-            "OBS",
-            "PONTOS_FORTES",
-            "PONTOS_FRACOS",
-            "CONCORRENTES",
-            "PORTE",
-        ],
-    }
 
-    def _resolve_col_once(field_key: str) -> str | None:
-        return _find_col(df_view, [field_key, field_key.replace("_", " ")])
-
-    nome_full = row_dict.get(COL_NOME) if COL_NOME else row_dict.get("NOME") or "Empresa"
-    st.subheader(str(nome_full))
-
-    company_prefix = stage_prefix_for_company(row_dict, COL_CNPJ, COL_NOME)
-    main_tabs = st.tabs(["🗂️ Dados", "📎 Apresentações", "💬 Comentários"])
-
-    # ==== TAB 1: Dados ====
-    with main_tabs[0]:
-        data_tabs = st.tabs(list(GROUPS.keys()))
-        changed_updates: dict[str, str | None] = {}
-
-        with st.form("form_edit_empresa"):
-            for (tab, (group_title, fields)) in zip(data_tabs, GROUPS.items()):
-                with tab:
-                    if group_title == "Descrição da Empresa":
-                        single = st.container()
-                        cA, cB = single, single
-                    else:
-                        cA, cB = st.columns(2)
-
-                    for idx, f in enumerate(fields):
-                        col_real = _resolve_col_once(f)
-                        label = f.replace("_", " ").title() if f not in {"CNPJ", "NDA_ASSINADO"} else ("CNPJ" if f=="CNPJ" else "NDA Assinado")
-                        val = row_dict.get(col_real) if col_real else None
-                        sval = "" if (val is None or (isinstance(val, float) and pd.isna(val))) else str(val)
-
-                        target_col = cA if (idx % 2 == 0) else cB
-                        f_norm = norm(f)
-                        col_norm = norm(col_real) if col_real else None
-
-                        def _first_token_or_vazio(v):
-                            toks = _split_tokens_cell(v)
-                            return toks[0] if toks else "Vazio"
-
-                        if group_title == "Datas do Contrato":
-                            if f in ("DATA_DA_ASSINATURA", "INICIO_RENOVACAO_ASSINATURA", "VIGENCIA"):
-                                d_default = _to_date_safe(val)
-                                with target_col:
-                                    new_d = st.date_input(
-                                        label,
-                                        value=d_default if d_default else _dt.date.today(),
-                                        format="DD/MM/YYYY"
-                                    )
-                                new_s = new_d.isoformat() if new_d else None
-                                if col_real and (new_s != (d_default.isoformat() if d_default else "")):
-                                    changed_updates[col_real] = new_s
-                            elif f == "NDA_ASSINADO":
-                                with target_col:
-                                    checked = st.checkbox(label, value=_to_bool_safe(val))
-                                new_s = _bool_to_simnao(checked)
-                                if col_real and (new_s.strip() != sval.strip()):
-                                    changed_updates[col_real] = new_s
-                            else:
-                                with target_col:
-                                    if len(sval) > 120 or "\n" in sval:
-                                        new_val = st.text_area(label, value=sval, height=100)
-                                    else:
-                                        new_val = st.text_input(label, value=sval)
-                                if col_real and (new_val.strip() != sval.strip()):
-                                    changed_updates[col_real] = new_val.strip() or None
-                        else:
-                            if COL_SIT and col_norm == norm(COL_SIT):
-                                opts_sit = _unique_token_opts(df_view, COL_SIT)
-                                current = _first_token_or_vazio(val)
-                                if current and current not in opts_sit:
-                                    opts_sit = [current] + [o for o in opts_sit if o != current]
-                                with target_col:
-                                    new_val = st.selectbox(label, options=opts_sit, index=opts_sit.index(current) if current in opts_sit else 0)
-                                if col_real and (str(new_val).strip() != sval.strip()):
-                                    changed_updates[col_real] = (None if new_val == "Vazio" else str(new_val).strip())
-
-                            elif COL_ATU and col_norm == norm(COL_ATU):
-                                opts_atu = _unique_token_opts(df_view, COL_ATU)
-                                current = _first_token_or_vazio(val)
-                                if current and current not in opts_atu:
-                                    opts_atu = [current] + [o for o in opts_atu if o != current]
-                                with target_col:
-                                    new_val = st.selectbox(label, options=opts_atu, index=opts_atu.index(current) if current in opts_atu else 0)
-                                if col_real and (str(new_val).strip() != sval.strip()):
-                                    changed_updates[col_real] = (None if new_val == "Vazio" else str(new_val).strip())
-
-                            else:
-                                with target_col:
-                                    if len(sval) > 120 or "\n" in sval:
-                                        new_val = st.text_area(label, value=sval, height=100)
-                                    else:
-                                        new_val = st.text_input(label, value=sval)
-                                if col_real and (new_val.strip() != sval.strip()):
-                                    changed_updates[col_real] = new_val.strip() or None
-
-            c1, c2 = st.columns([1, 3])
-            with c1:
-                submitted = st.form_submit_button("💾 Salvar alterações", use_container_width=True, type="primary")
-            with c2:
-                st.caption("Somente campos modificados são atualizados no banco.")
-
-            if submitted:
-                if not changed_updates:
-                    st.info("Nenhuma alteração detectada.")
-                else:
-                    try:
-                        key_val = row_dict.get(COL_KEY)
-                        if key_val is None or (isinstance(key_val, float) and pd.isna(key_val)):
-                            st.error("Não foi possível determinar a chave (ID/CNPJ/NOME) para atualizar.")
-                        else:
-                            update_company_row(FQN_NEW, COL_KEY, key_val, changed_updates)
-                            clear_companies_cache()
-                            st.success("Alterações salvas com sucesso.")
-                            st.rerun()
-                    except Exception as e:
-                        st.error(f"Falha ao salvar alterações: {e}")
-
-    # ==== TAB 2: Apresentações ====
-    with main_tabs[1]:
-        up_files = st.file_uploader("Enviar arquivos", type=None, accept_multiple_files=True)
-        if up_files:
-            for uf in up_files:
-                try:
-                    upload_presentation(company_prefix, uf, uf.name)
-                    st.success(f"Enviado: {uf.name}")
-                except Exception as e:
-                    st.error(f"Falha ao enviar {uf.name}: {e}")
-
-        st.divider()
-        try:
-            files_df = list_presentations(company_prefix)
-        except Exception as e:
-            st.error(f"Falha ao listar arquivos: {e}")
-            files_df = pd.DataFrame()
-
-        if files_df.empty:
-            st.info("Nenhum arquivo disponível.")
-        else:
-            files_df.columns = [c.lower() for c in files_df.columns]
-            for _, fr in files_df.iterrows():
-                full_name = str(fr.get('"name"', ""))
-                base = full_name.split("/")[-1] if "/" in full_name else full_name
-                try:
-                    url = get_presigned_url(company_prefix, base, expires_seconds=3600)
-                    if url:
-                        st.link_button(f"🔗 {base}", url, use_container_width=True)
-                    else:
-                        data = download_presentation(company_prefix, base)
-                        st.download_button(
-                            f"⬇️ {base}",
-                            data=data,
-                            file_name=base,
-                            mime="application/octet-stream",
-                            use_container_width=True,
-                        )
-                except Exception as e:
-                    st.error(f"Falha ao baixar {base}: {e}")
-
-    # ==== TAB 3: Comentários ====
-    with main_tabs[2]:
-        user = None
-        try:
-            user = current_user()
-        except Exception:
-            pass
-
-        key_val = row_dict.get(COL_KEY)
-
-        st.markdown("**Registrar novo comentário**")
-        with st.form("form_comentario"):
-            msg = st.text_area("Escreva seu comentário", placeholder="Digite aqui...", height=120)
-            submitted_c = st.form_submit_button("💬 Publicar", type="primary", use_container_width=True)
-
-        if submitted_c:
-            if not msg.strip():
-                st.warning("Comentário vazio.")
-            elif key_val is None or (isinstance(key_val, float) and pd.isna(key_val)):
-                st.error("Não foi possível associar o comentário à empresa (chave ausente).")
-            else:
-                try:
-                    username = (user or {}).get("username") or (user or {}).get("user") or "desconhecido"
-                    display_name = (user or {}).get("name") or username
-                    created_at = datetime.now(ZoneInfo("America/Sao_Paulo"))
-                    save_company_comment(
-                        empresa_id=str(key_val),
-                        username=str(username),
-                        name=str(display_name),
-                        message=str(msg),
-                        created_at=created_at,
-                    )
-                    st.success("Comentário publicado.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Falha ao salvar comentário: {e}")
-
-        st.divider()
-        st.markdown("**Comentários**")
-        try:
-            dfc = fetch_company_comments(str(key_val))
-        except Exception as e:
-            st.error(f"Falha ao carregar comentários: {e}")
-            dfc = pd.DataFrame()
-
-        if dfc.empty:
-            st.info("Ainda não há comentários.")
-        else:
-            for _, r in dfc.iterrows():
-                nm = str(r.get("NAME") or r.get("USERNAME") or "Usuário")
-                msg = str(r.get("MESSAGE") or "")
-                ts = r.get("CREATED_AT")
-                try:
-                    ts_fmt = pd.to_datetime(ts).strftime("%d/%m/%Y %H:%M")
-                except Exception:
-                    ts_fmt = "-"
-                st.markdown(f"**{nm}** · {ts_fmt}")
-                st.markdown(msg)
-                st.markdown("---")
